@@ -47,7 +47,7 @@ func TestFSStoreTaskStore(t *testing.T) {
 }
 
 func TestFSStoreLogStore(t *testing.T) {
-	RunLogStoreTests(t, func() manager.LogStore {
+	RunLogStoreTests(t, func() logRunStore {
 		fs, _ := openFSStore(t)
 		return fs
 	})

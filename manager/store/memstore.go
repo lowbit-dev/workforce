@@ -13,20 +13,25 @@ import (
 	"lowbit.dev/workforce/manager/webhooks"
 )
 
-// MemStore is an in-memory implementation of JobStore, TaskStore, LogStore, and WebhookStore.
+// MemStore is an in-memory implementation of JobStore, TaskStore, LogStore, RunStore, and WebhookStore.
 // It provides best-effort delivery — state is lost on process exit.
 // Safe for concurrent use from multiple goroutines.
 type MemStore struct {
 	mu sync.RWMutex
 
 	jobs     map[string]*contract.Job
-	taskDefs map[string]*contract.Task // task definitions, keyed by Task.Name
+	taskDefs map[string]*contract.Task   // task definitions, keyed by Task.Name
+	runs     map[string]*contract.JobRun // runID → JobRun
 
 	// logMu guards log buffers and subscribers independently from the main mu
 	// to avoid holding the write lock during potentially slow subscriber sends.
-	logMu       sync.Mutex
-	logs        map[string]*bytes.Buffer // jobID → accumulated log
-	subscribers map[string][]chan []byte // jobID → broadcast channels
+	logMu sync.Mutex
+	// runLogs: runID → accumulated log bytes
+	runLogs map[string]*bytes.Buffer
+	// runSubscribers: runID → broadcast channels for that specific run
+	runSubscribers map[string][]chan []byte
+	// jobSubscribers: jobID → broadcast channels that receive chunks from any run for that job
+	jobSubscribers map[string][]chan []byte
 
 	webhooks map[string]*webhooks.WebhookEntry
 }
@@ -34,11 +39,13 @@ type MemStore struct {
 // NewMemStore allocates and returns a ready-to-use MemStore.
 func NewMemStore() *MemStore {
 	return &MemStore{
-		jobs:        make(map[string]*contract.Job),
-		taskDefs:    make(map[string]*contract.Task),
-		logs:        make(map[string]*bytes.Buffer),
-		subscribers: make(map[string][]chan []byte),
-		webhooks:    make(map[string]*webhooks.WebhookEntry),
+		jobs:           make(map[string]*contract.Job),
+		taskDefs:       make(map[string]*contract.Task),
+		runs:           make(map[string]*contract.JobRun),
+		runLogs:        make(map[string]*bytes.Buffer),
+		runSubscribers: make(map[string][]chan []byte),
+		jobSubscribers: make(map[string][]chan []byte),
+		webhooks:       make(map[string]*webhooks.WebhookEntry),
 	}
 }
 
@@ -74,7 +81,7 @@ func (m *MemStore) UpdateJob(_ context.Context, id string, mutate func(*contract
 	return nil
 }
 
-// ListJobs returns a page of root jobs (ParentJobID == "") ordered by CreatedAt ascending.
+// ListJobs returns a page of root jobs (ParentJobID == "") ordered by CreatedAt descending.
 // cursor is the ID of the last job seen; empty string starts from the beginning.
 func (m *MemStore) ListJobs(_ context.Context, cursor string, limit int) ([]*contract.Job, string, error) {
 	m.mu.RLock()
@@ -89,7 +96,7 @@ func (m *MemStore) ListJobs(_ context.Context, cursor string, limit int) ([]*con
 	m.mu.RUnlock()
 
 	sort.Slice(all, func(i, j int) bool {
-		return all[i].CreatedAt.Before(all[j].CreatedAt)
+		return all[i].CreatedAt.After(all[j].CreatedAt)
 	})
 
 	start := 0
@@ -233,39 +240,72 @@ func (m *MemStore) DeleteTask(_ context.Context, name string) error {
 
 // ---- LogStore ----
 
-func (m *MemStore) AppendJobLog(_ context.Context, jobID string, data []byte) error {
+func (m *MemStore) AppendRunLog(_ context.Context, runID string, data []byte) error {
 	m.logMu.Lock()
-	buf, ok := m.logs[jobID]
+	buf, ok := m.runLogs[runID]
 	if !ok {
 		buf = &bytes.Buffer{}
-		m.logs[jobID] = buf
+		m.runLogs[runID] = buf
 	}
 	buf.Write(data)
-	subs := m.subscribers[jobID]
+	runSubs := m.runSubscribers[runID]
+
+	// Determine which jobID owns this run so we can forward to job-level subscribers.
+	var jobSubs []chan []byte
+	m.mu.RLock()
+	if run, ok := m.runs[runID]; ok {
+		jobSubs = m.jobSubscribers[run.JobID]
+	}
+	m.mu.RUnlock()
+
 	m.logMu.Unlock()
 
-	// Broadcast to subscribers outside the lock to avoid blocking appenders.
 	chunk := make([]byte, len(data))
 	copy(chunk, data)
-	for _, ch := range subs {
+	for _, ch := range runSubs {
 		select {
 		case ch <- chunk:
 		default:
-			// Slow subscriber; drop chunk to avoid blocking the writer.
+		}
+	}
+	for _, ch := range jobSubs {
+		select {
+		case ch <- chunk:
+		default:
 		}
 	}
 	return nil
 }
 
-func (m *MemStore) GetJobLogReader(_ context.Context, jobID string) (io.ReadCloser, error) {
+func (m *MemStore) GetRunLogReader(_ context.Context, runID string) (io.ReadCloser, error) {
 	m.logMu.Lock()
 	defer m.logMu.Unlock()
-	buf, ok := m.logs[jobID]
+	buf, ok := m.runLogs[runID]
 	if !ok {
 		return io.NopCloser(bytes.NewReader(nil)), nil
 	}
 	snapshot := make([]byte, buf.Len())
 	copy(snapshot, buf.Bytes())
+	return io.NopCloser(bytes.NewReader(snapshot)), nil
+}
+
+func (m *MemStore) GetJobLogReader(ctx context.Context, jobID string) (io.ReadCloser, error) {
+	runs, err := m.ListJobRuns(ctx, jobID)
+	if err != nil {
+		return nil, err
+	}
+
+	var combined bytes.Buffer
+	m.logMu.Lock()
+	for _, run := range runs {
+		if buf, ok := m.runLogs[run.ID]; ok {
+			combined.Write(buf.Bytes())
+		}
+	}
+	m.logMu.Unlock()
+
+	snapshot := make([]byte, combined.Len())
+	copy(snapshot, combined.Bytes())
 	return io.NopCloser(bytes.NewReader(snapshot)), nil
 }
 
@@ -283,13 +323,19 @@ func (m *MemStore) GetRootJobLogReader(ctx context.Context, rootJobID string) (i
 	}
 
 	var combined bytes.Buffer
-	m.logMu.Lock()
-	for _, id := range jobIDs {
-		if buf, ok := m.logs[id]; ok {
-			combined.Write(buf.Bytes())
+	for _, jobID := range jobIDs {
+		runs, err := m.ListJobRuns(ctx, jobID)
+		if err != nil {
+			return nil, err
 		}
+		m.logMu.Lock()
+		for _, run := range runs {
+			if buf, ok := m.runLogs[run.ID]; ok {
+				combined.Write(buf.Bytes())
+			}
+		}
+		m.logMu.Unlock()
 	}
-	m.logMu.Unlock()
 
 	snapshot := make([]byte, combined.Len())
 	copy(snapshot, combined.Bytes())
@@ -300,22 +346,25 @@ func (m *MemStore) SubscribeJobLogs(ctx context.Context, jobID string) (<-chan [
 	ch := make(chan []byte, 64)
 
 	m.logMu.Lock()
-	// Drain any existing buffered log first.
-	if buf, ok := m.logs[jobID]; ok && buf.Len() > 0 {
-		snapshot := make([]byte, buf.Len())
-		copy(snapshot, buf.Bytes())
-		ch <- snapshot
+	// Drain any existing buffered log (across all runs) first.
+	runs, _ := m.ListJobRuns(ctx, jobID)
+	for _, run := range runs {
+		if buf, ok := m.runLogs[run.ID]; ok && buf.Len() > 0 {
+			snapshot := make([]byte, buf.Len())
+			copy(snapshot, buf.Bytes())
+			ch <- snapshot
+		}
 	}
-	m.subscribers[jobID] = append(m.subscribers[jobID], ch)
+	m.jobSubscribers[jobID] = append(m.jobSubscribers[jobID], ch)
 	m.logMu.Unlock()
 
 	go func() {
 		<-ctx.Done()
 		m.logMu.Lock()
-		subs := m.subscribers[jobID]
+		subs := m.jobSubscribers[jobID]
 		for i, sub := range subs {
 			if sub == ch {
-				m.subscribers[jobID] = append(subs[:i], subs[i+1:]...)
+				m.jobSubscribers[jobID] = append(subs[:i], subs[i+1:]...)
 				break
 			}
 		}
@@ -326,15 +375,94 @@ func (m *MemStore) SubscribeJobLogs(ctx context.Context, jobID string) (<-chan [
 	return ch, nil
 }
 
-// CloseJobLogSubscribers closes all subscriber channels for a job.
-// Call this when a job reaches a terminal state so SSE handlers exit cleanly.
-func (m *MemStore) CloseJobLogSubscribers(jobID string) {
+func (m *MemStore) SubscribeRunLogs(_ context.Context, runID string) (<-chan []byte, error) {
+	ch := make(chan []byte, 64)
+
+	m.logMu.Lock()
+	if buf, ok := m.runLogs[runID]; ok && buf.Len() > 0 {
+		snapshot := make([]byte, buf.Len())
+		copy(snapshot, buf.Bytes())
+		ch <- snapshot
+	}
+	m.runSubscribers[runID] = append(m.runSubscribers[runID], ch)
+	m.logMu.Unlock()
+
+	return ch, nil
+}
+
+// CloseRunLogSubscribers closes all subscriber channels for a run.
+func (m *MemStore) CloseRunLogSubscribers(runID string) error {
 	m.logMu.Lock()
 	defer m.logMu.Unlock()
-	for _, ch := range m.subscribers[jobID] {
+	for _, ch := range m.runSubscribers[runID] {
 		close(ch)
 	}
-	delete(m.subscribers, jobID)
+	delete(m.runSubscribers, runID)
+
+	return nil
+}
+
+// CloseJobLogSubscribers closes all job-level subscriber channels.
+// Call this when a job reaches a terminal state so SSE handlers exit cleanly.
+func (m *MemStore) CloseJobLogSubscribers(jobID string) error {
+	m.logMu.Lock()
+	defer m.logMu.Unlock()
+	for _, ch := range m.jobSubscribers[jobID] {
+		close(ch)
+	}
+	delete(m.jobSubscribers, jobID)
+	return nil
+}
+
+// ---- RunStore ----
+
+func (m *MemStore) CreateRun(_ context.Context, run *contract.JobRun) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cp := *run
+	m.runs[run.ID] = &cp
+	return nil
+}
+
+func (m *MemStore) UpdateRun(_ context.Context, id string, mutate func(*contract.JobRun)) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	run, ok := m.runs[id]
+	if !ok {
+		return fmt.Errorf("run %q not found", id)
+	}
+	mutate(run)
+	return nil
+}
+
+func (m *MemStore) GetRun(_ context.Context, id string) (*contract.JobRun, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	run, ok := m.runs[id]
+	if !ok {
+		return nil, fmt.Errorf("run %q not found", id)
+	}
+	cp := *run
+	return &cp, nil
+}
+
+func (m *MemStore) ListJobRuns(_ context.Context, jobID string) ([]*contract.JobRun, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	var out []*contract.JobRun
+	for _, r := range m.runs {
+		if r.JobID == jobID {
+			cp := *r
+			out = append(out, &cp)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].StartedAt.IsZero() || out[j].StartedAt.IsZero() {
+			return out[i].Attempt < out[j].Attempt
+		}
+		return out[i].StartedAt.Before(out[j].StartedAt)
+	})
+	return out, nil
 }
 
 // ---- WebhookStore ----

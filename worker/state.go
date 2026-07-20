@@ -6,10 +6,11 @@ import "sync/atomic"
 type state int32
 
 const (
-	stateOnline       state = iota // Connected; accepting proposals and running tasks.
-	stateDraining                  // Not accepting new proposals; finishing in-progress tasks.
-	stateShuttingDown              //
-	stateOffline                   // Not connected; reconnect loop active or exited.
+	stateOnline state = iota // Connected; accepting proposals and running tasks.
+	statePressure
+	stateDraining     // Not accepting new proposals; finishing in-progress tasks.
+	stateOffline      // Not connected; reconnect loop active or exited.
+	stateShuttingDown //
 )
 
 func (s state) String() string {

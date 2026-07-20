@@ -40,7 +40,7 @@ func (w *Worker) sendError(code, message string) {
 }
 
 func (w *Worker) handlePropose(msg *contract.ProposeMessage) {
-	if w.state.load() != stateOnline {
+	if !w.state.Is(contract.WorkerStateOnline) {
 		w.send(fmt.Sprintf("reject --job-id=%s --reason=draining", msg.JobID))
 		return
 	}
@@ -86,10 +86,10 @@ func (w *Worker) handleDispatch(ctx context.Context, msg *contract.DispatchMessa
 
 	delete(w.pendingJobs, msg.JobID)
 	taskCtx, cancel := context.WithCancel(ctx)
-	w.tasks[msg.JobID] = &activeTask{cancel: cancel, cost: proposal.Cost}
+	w.tasks[msg.JobID] = &activeTask{cancel: cancel, cost: proposal.Cost, runID: msg.RunID}
 	w.tasksMu.Unlock()
 
-	w.send(fmt.Sprintf("staged --job-id=%s", msg.JobID))
+	w.send(fmt.Sprintf("staged --job-id=%s --run-id=%s", msg.JobID, msg.RunID))
 
 	go w.runJob(taskCtx, proposal, msg)
 }
@@ -99,9 +99,10 @@ func (w *Worker) handleSystem(msg *contract.SystemMessage) {
 
 	switch msg.Command {
 	case "drain":
-		w.state.store(stateDraining)
+		w.state.Store(contract.WorkerStateDraining)
+		// TODO: maybe it would help if we actually drained here....
 	case "shutdown":
-		if w.state.transition(stateOnline, stateShuttingDown) || w.state.transition(stateDraining, stateShuttingDown) {
+		if w.state.Transition(contract.WorkerStateOnline, contract.WorkerStateShuttingDown) || w.state.Transition(contract.WorkerStateDraining, contract.WorkerStateShuttingDown) {
 			close(w.done)
 		}
 	}
@@ -131,7 +132,7 @@ func (w *Worker) runJob(ctx context.Context, proposal *contract.ProposeMessage, 
 		return
 	}
 
-	w.send(fmt.Sprintf("starting --job-id=%s", dispatch.JobID))
+	w.send(fmt.Sprintf("starting --job-id=%s --run-id=%s", dispatch.JobID, dispatch.RunID))
 
 	t := taskExec{
 		JobID:       dispatch.JobID,
@@ -152,25 +153,38 @@ func (w *Worker) runJob(ctx context.Context, proposal *contract.ProposeMessage, 
 		},
 	}
 
-	logWriter := &logLineWriter{jobID: dispatch.JobID, w: w}
+	logWriter := &logLineWriter{jobID: dispatch.JobID, runID: dispatch.RunID, w: w}
 
-	logHeader := fmt.Sprintf("log --job-id=%s", dispatch.JobID)
-
+	logHeader := fmt.Sprintf("log --job-id=%s --run-id=%s", dispatch.JobID, dispatch.RunID)
 	headertmpl := `
 ┌────────────────────────────────────────────────────────
 │  %s
 │  phase:   %s
 │  attempt: %d
 │  job:     %s
+│  run:     %s
 │  time:    %s
 │  worker:  %s
 └────────────────────────────────────────────────────────
 `
-	w.sendWithPayload(logHeader, []byte(fmt.Sprintf(headertmpl, proposal.Task, dispatch.Phase, dispatch.Attempt, dispatch.JobID, time.Now().Format(time.RFC3339), w.cfg.WorkerID)))
+	w.sendWithPayload(logHeader, []byte(fmt.Sprintf(headertmpl, proposal.Task, dispatch.Phase, dispatch.Attempt, dispatch.JobID, dispatch.RunID, time.Now().Format(time.RFC3339), w.cfg.WorkerID)))
 
 	start := time.Now()
 	resultData, childJobsData, warnings, err := w.RunTask(ctx, t, logWriter)
 	duration := time.Since(start)
+
+	logFooterHeader := fmt.Sprintf("log --job-id=%s --run-id=%s", dispatch.JobID, dispatch.RunID)
+	footertmpl := `
+
+
+┌────────────────────────────────────────────────────────
+│  status:   %s
+│  time:     %s
+│  duration: %s
+└────────────────────────────────────────────────────────
+
+%s
+`
 
 	if err != nil {
 		code, reason, isExit := IsExitError(err)
@@ -178,21 +192,26 @@ func (w *Worker) runJob(ctx context.Context, proposal *contract.ProposeMessage, 
 			reason = err.Error()
 		}
 
-		// --reason='%s'
-		header := fmt.Sprintf("result --job-id=%s --type=error --exit-code=%d --duration=%s", dispatch.JobID, code, duration.String())
+		w.sendWithPayload(logFooterHeader, []byte(fmt.Sprintf(footertmpl, "failed", time.Now().Format(time.RFC3339), duration.String(), reason)))
+
+		header := fmt.Sprintf("result --job-id=%s --run-id=%s --type=error --exit-code=%d --duration=%s", dispatch.JobID, dispatch.RunID, code, duration.String())
 		slog.Debug("[Worker][runJob] Sending job error message", "header", header)
 		w.sendWithPayload(header, []byte(reason))
 		return
 	}
 
 	if len(childJobsData) > 0 {
-		header := fmt.Sprintf("result --job-id=%s --type=subjobs --duration=%s", dispatch.JobID, duration.String())
+		w.sendWithPayload(logFooterHeader, []byte(fmt.Sprintf(footertmpl, "success", time.Now().Format(time.RFC3339), duration.String(), string(childJobsData))))
+
+		header := fmt.Sprintf("result --job-id=%s --run-id=%s --type=subjobs --duration=%s", dispatch.JobID, dispatch.RunID, duration.String())
 		slog.Debug("[Worker][runJob] Sending child job result message", "header", header, "payload", string(childJobsData))
 		w.sendWithPayload(header, childJobsData)
 		return
 	}
 
-	header := fmt.Sprintf("result --job-id=%s --type=result --duration=%s", dispatch.JobID, duration.String())
+	w.sendWithPayload(logFooterHeader, []byte(fmt.Sprintf(footertmpl, "success", time.Now().Format(time.RFC3339), duration.String(), string(resultData))))
+
+	header := fmt.Sprintf("result --job-id=%s --run-id=%s --type=result --duration=%s", dispatch.JobID, dispatch.RunID, duration.String())
 	if warnings != "" {
 		header += fmt.Sprintf(" --warnings='%s'", sanitize(warnings))
 	}
@@ -215,6 +234,7 @@ func sanitize(s string) string {
 // binary's stdout to the manager as a "log" message.
 type logLineWriter struct {
 	jobID string
+	runID string
 	w     *Worker
 	buf   []byte
 }
@@ -228,7 +248,7 @@ func (l *logLineWriter) Write(p []byte) (int, error) {
 		}
 		line := l.buf[:idx]
 		l.buf = l.buf[idx+1:]
-		l.w.sendWithPayload(fmt.Sprintf("log --job-id=%s", l.jobID), line)
+		l.w.sendWithPayload(fmt.Sprintf("log --job-id=%s --run-id=%s", l.jobID, l.runID), line)
 	}
 	return len(p), nil
 }
@@ -242,7 +262,9 @@ func (w *Worker) releaseTask(jobID string) {
 	remaining := len(w.tasks)
 	w.tasksMu.Unlock()
 
-	if w.state.transition(stateDraining, stateShuttingDown) && remaining == 0 {
+	if (w.state.Is(contract.WorkerStateDraining) || w.state.Is(contract.WorkerStateShuttingDown)) && remaining == 0 {
+		w.state.Store(contract.WorkerStateShuttingDown)
+
 		w.cfg.Logger.Info("[Worker][releaseTask] Drain completed. Closing connection...")
 		w.conn.Close()
 	}

@@ -16,6 +16,7 @@ var (
 	ErrUnknownTask        error = errors.New("unknown task")
 	ErrUnknownJob         error = errors.New("unknown job")
 	ErrNoEledgibleWorkers error = errors.New("no elegible workers")
+	ErrNoArtifactPlatform error = errors.New("no artifact platform available")
 	ErrProposalRejected   error = errors.New("proposal rejected by worker")
 	ErrProposalTimedout   error = errors.New("proposal timedout")
 )
@@ -39,6 +40,8 @@ func (m *Manager) DispatcherRoutine(ctx context.Context) error {
 // ProcessQueue pops and dispatches jobs until either the heap is empty or
 // no eligible worker can be found.
 func (m *Manager) ProcessQueue(ctx context.Context) error {
+	m.lastDispatchRun.Store(uint64(time.Now().Unix()))
+
 	for job := m.PopNextJobFromQueue(); job != nil; job = m.PopNextJobFromQueue() {
 
 		// TODO: Make TryPropose return an error,
@@ -146,12 +149,17 @@ func (m *Manager) tryProposeJob(ctx context.Context, job *contract.Job) error {
 			return err
 		}
 
+		if len(platforms) == 0 {
+			m.Logger().Warn("dispatcher: no artifact platforms for task/version", "job_id", job.ID, "task", job.TaskName, "version", job.ArtifactVersion)
+			return ErrNoArtifactPlatform
+		}
+
 		for _, p := range platforms {
 			platformKeys = append(platformKeys, platformKey(p.OS, p.Arch))
 		}
 	}
 
-	workers := m.workers.eligibleWorkers(platformKeys, job.Cost)
+	workers := m.workers.eligibleWorkers(platformKeys, job.Cost, job.ID)
 	if len(workers) == 0 {
 		return ErrNoEledgibleWorkers
 	}
@@ -336,7 +344,7 @@ func (m *Manager) checkResourceShortage(ctx context.Context) {
 
 		// Use minCost so that workers with some available capacity but not enough to
 		// satisfy even the cheapest pending job are correctly flagged as unsatisfied.
-		if len(m.workers.eligibleWorkers(platformKeys, demand.minCost)) == 0 {
+		if len(m.workers.eligibleWorkers(platformKeys, demand.minCost, "")) == 0 {
 			for key, p := range platformsByKey {
 				if _, ok := platformDemand[key]; !ok {
 					platformDemand[key] = &PlatformDemand{OS: p.OS, Arch: p.Arch}

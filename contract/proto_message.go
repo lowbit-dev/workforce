@@ -40,6 +40,7 @@ func requireFlag(flags netargv.FlagSet, name string) (string, error) {
 	if !ok || v == "" {
 		return "", fmt.Errorf("missing required flag --%s", name)
 	}
+
 	return v, nil
 }
 
@@ -48,11 +49,55 @@ func requireInt(flags netargv.FlagSet, name string) (int, error) {
 	if err != nil {
 		return 0, err
 	}
+
 	n, err := strconv.Atoi(s)
 	if err != nil {
 		return 0, fmt.Errorf("flag --%s: %w", name, err)
 	}
+
 	return n, nil
+}
+
+func requireFloat(flags netargv.FlagSet, name string) (float64, error) {
+	s, err := requireFlag(flags, name)
+	if err != nil {
+		return 0, err
+	}
+
+	n, err := strconv.ParseFloat(s, 64)
+	if err != nil {
+		return 0, fmt.Errorf("flag --%s: %w", name, err)
+	}
+
+	return n, nil
+}
+
+func optionalInt(flags netargv.FlagSet, name string) (int, bool, error) {
+	s, err := requireFlag(flags, name)
+	if err != nil {
+		return 0, false, nil
+	}
+
+	n, err := strconv.Atoi(s)
+	if err != nil {
+		return 0, true, fmt.Errorf("flag --%s: %w", name, err)
+	}
+
+	return n, true, nil
+}
+
+func optionalFloat(flags netargv.FlagSet, name string) (float64, bool, error) {
+	s, err := requireFlag(flags, name)
+	if err != nil {
+		return 0, false, nil
+	}
+
+	n, err := strconv.ParseFloat(s, 64)
+	if err != nil {
+		return 0, true, fmt.Errorf("flag --%s: %w", name, err)
+	}
+
+	return n, true, nil
 }
 
 // ---- ProposeMessage ----
@@ -126,6 +171,7 @@ func FormulateProposeV0Message(job *Job, artifactInfo *ArtifactInfo) string {
 // It carries the runtime constraints, execution context, and the actual stdin payload.
 type DispatchMessage struct {
 	JobID          string
+	RunID          string // manager-generated run identifier; echoed back on all subsequent frames
 	Phase          string
 	Attempt        int
 	MaxExecTime    time.Duration
@@ -154,8 +200,14 @@ func dispatchV0Factory(m netargv.Message) (Message, error) {
 		return nil, err
 	}
 
+	runID, err := requireFlag(flags, "run-id")
+	if err != nil {
+		return nil, err
+	}
+
 	msg := &DispatchMessage{
 		JobID:   jobID,
+		RunID:   runID,
 		Phase:   phase,
 		Attempt: attempt,
 		Payload: m.Payload(),
@@ -186,9 +238,9 @@ func dispatchV0Factory(m netargv.Message) (Message, error) {
 	return msg, nil
 }
 
-func FormulateDispatchV0Message(job *Job) string {
-	return fmt.Sprintf("dispatch --job-id=%s --phase=%s --attempt=%d",
-		job.ID, string(job.Phase), job.Attempts,
+func FormulateDispatchV0Message(job *Job, runID string) string {
+	return fmt.Sprintf("dispatch --job-id=%s --run-id=%s --phase=%s --attempt=%d",
+		job.ID, runID, string(job.Phase), job.Attempts,
 	)
 }
 
@@ -199,14 +251,20 @@ func FormulateDispatchV0Message(job *Job) string {
 // (e.g. fetching the artifact binary). A reject sent after staged releases the slot.
 type StagedMessage struct {
 	JobID string
+	RunID string // echoed from DispatchMessage
 }
 
 func stagedV0Factory(m netargv.Message) (Message, error) {
-	jobID, err := requireFlag(m.Flags(), "job-id")
+	flags := m.Flags()
+	jobID, err := requireFlag(flags, "job-id")
 	if err != nil {
 		return nil, err
 	}
-	return &StagedMessage{JobID: jobID}, nil
+	runID, err := requireFlag(flags, "run-id")
+	if err != nil {
+		return nil, err
+	}
+	return &StagedMessage{JobID: jobID, RunID: runID}, nil
 }
 
 // ---- AcceptMessage ----
@@ -251,14 +309,20 @@ func rejectV0Factory(m netargv.Message) (Message, error) {
 // StartingMessage is sent Worker → Manager once the task binary has been fetched and started.
 type StartingMessage struct {
 	JobID string
+	RunID string // echoed from DispatchMessage
 }
 
 func startingV0Factory(m netargv.Message) (Message, error) {
-	jobID, err := requireFlag(m.Flags(), "job-id")
+	flags := m.Flags()
+	jobID, err := requireFlag(flags, "job-id")
 	if err != nil {
 		return nil, err
 	}
-	return &StartingMessage{JobID: jobID}, nil
+	runID, err := requireFlag(flags, "run-id")
+	if err != nil {
+		return nil, err
+	}
+	return &StartingMessage{JobID: jobID, RunID: runID}, nil
 }
 
 // ---- LogMessage ----
@@ -267,15 +331,21 @@ func startingV0Factory(m netargv.Message) (Message, error) {
 // The line content is carried as the message payload.
 type LogMessage struct {
 	JobID string
+	RunID string // echoed from DispatchMessage
 	Line  []byte
 }
 
 func logV0Factory(m netargv.Message) (Message, error) {
-	jobID, err := requireFlag(m.Flags(), "job-id")
+	flags := m.Flags()
+	jobID, err := requireFlag(flags, "job-id")
 	if err != nil {
 		return nil, err
 	}
-	return &LogMessage{JobID: jobID, Line: m.Payload()}, nil
+	runID, err := requireFlag(flags, "run-id")
+	if err != nil {
+		return nil, err
+	}
+	return &LogMessage{JobID: jobID, RunID: runID, Line: m.Payload()}, nil
 }
 
 // ---- ResultMessage ----
@@ -307,6 +377,7 @@ type ChildJobRequest struct {
 type ResultMessage struct {
 	ParentJobID string
 	JobID       string
+	RunID       string // echoed from DispatchMessage
 	Type        ResultType
 	Duration    time.Duration     // wall-clock time the task binary ran (excludes artifact fetch)
 	Warnings    string            // result: non-empty stderr on a clean exit
@@ -330,9 +401,15 @@ func resultV0Factory(m netargv.Message) (Message, error) {
 		return nil, err
 	}
 
+	runID, err := requireFlag(flags, "run-id")
+	if err != nil {
+		return nil, err
+	}
+
 	parentJobID, _ := flags.Lookup("parent-job-id")
 	msg := &ResultMessage{
 		JobID:       jobID,
+		RunID:       runID,
 		ParentJobID: parentJobID,
 		Type:        ResultType(outcomeType),
 		Duration:    -1,
@@ -384,10 +461,39 @@ func resultV0Factory(m netargv.Message) (Message, error) {
 // ---- HeartbeatMessage ----
 
 // HeartbeatMessage is sent Worker → Manager as a keepalive ping; echoed back by the Manager as pong.
-type HeartbeatMessage struct{}
+type HeartbeatMessage struct {
+	CPUPercent    float64
+	MemoryPercent float64
+	State         WorkerState
+}
 
-func heartbeatV0Factory(_ netargv.Message) (Message, error) {
-	return &HeartbeatMessage{}, nil
+func heartbeatV0Factory(m netargv.Message) (Message, error) {
+	flags := m.Flags()
+
+	cpu, found, err := optionalFloat(flags, "cpu")
+	if found && err != nil {
+		return nil, err
+	}
+
+	mem, err := requireFloat(flags, "mem")
+	if found && err != nil {
+		return nil, err
+	}
+
+	state, found, err := optionalInt(flags, "state")
+	if found && err != nil {
+		return nil, err
+	}
+
+	if found && !IsValidWorkerState(state) {
+		return nil, errors.New("flag --state is not a valid state")
+	}
+
+	return &HeartbeatMessage{
+		CPUPercent:    cpu,
+		MemoryPercent: mem,
+		State:         WorkerState(state),
+	}, nil
 }
 
 // ---- SystemMessage ----

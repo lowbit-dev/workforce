@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log/slog"
 	"net/http"
 	"strings"
 	"time"
@@ -52,6 +51,12 @@ func (m *Manager) buildMux() http.Handler {
 	clientAuth := mux.Group("").Use(m.clientAuth, clientRL.Middleware)
 
 	// ---------------------------------------------------------------------
+	// Manager
+	// ---------------------------------------------------------------------
+	clientAuth.HandleFunc("GET /manager/log", func(w http.ResponseWriter, r *http.Request) {})
+	clientAuth.HandleFunc("GET /manager/log/stream", func(w http.ResponseWriter, r *http.Request) {})
+
+	// ---------------------------------------------------------------------
 	// Workers
 	// ---------------------------------------------------------------------
 	clientAuth.HandleFunc("GET /workers", m.handleListWorkers)
@@ -75,6 +80,9 @@ func (m *Manager) buildMux() http.Handler {
 	clientAuth.HandleFunc("DELETE /jobs/{id}", m.handleCancelJob)
 	clientAuth.HandleFunc("GET /jobs/{id}/logs", m.handleJobLogs)
 	clientAuth.HandleFunc("GET /jobs/{id}/logs/stream", m.handleJobLogsStream)
+	clientAuth.HandleFunc("GET /jobs/{id}/runs", m.handleListJobRuns)
+	clientAuth.HandleFunc("GET /jobs/{id}/runs/{runID}/logs", m.handleRunLogs)
+	clientAuth.HandleFunc("GET /jobs/{id}/runs/{runID}/logs/stream", m.handleRunLogsStream)
 	clientAuth.HandleFunc("GET /jobs/{id}/children", m.handleListChildJobs)
 
 	// ---------------------------------------------------------------------
@@ -126,7 +134,7 @@ func (m *Manager) signedArtifactMiddleware(next http.Handler) http.Handler {
 		}
 
 		verifiable := m.cfg.Domain + r.URL.String()
-		slog.Debug("[Manager][HTTP][signedArtifactMiddleware] Verifying signed url", "url", verifiable)
+		m.Logger().Debug("[Manager][HTTP][signedArtifactMiddleware] Verifying signed url", "url", verifiable)
 
 		if err := m.urlSigner.Verify(verifiable); err != nil {
 			detail := "You are unauthorized to access this resource"
@@ -138,7 +146,7 @@ func (m *Manager) signedArtifactMiddleware(next http.Handler) http.Handler {
 				detail = "This resource requires a valid signature to access"
 			}
 
-			slog.Debug("[Manager][HTTP][signedArtifactMiddleware] URL invalid", "error", err)
+			m.Logger().Debug("[Manager][HTTP][signedArtifactMiddleware] URL invalid", "error", err)
 
 			problemjson.Unauthorized(problemjson.Detail(detail)).ServeHTTP(w, r)
 			return
@@ -247,10 +255,11 @@ func (m *Manager) handleDisconnectWorker(w http.ResponseWriter, r *http.Request)
 // ---- /cluster ----
 
 type clusterWorkerCounts struct {
-	Total    int `json:"total"`
-	Online   int `json:"online"`
-	Draining int `json:"draining"`
-	Offline  int `json:"offline"`
+	Total     int `json:"total"`
+	Online    int `json:"online"`
+	Pressured int `json:"pressured"`
+	Draining  int `json:"draining"`
+	Offline   int `json:"offline"`
 }
 
 type clusterCapacity struct {
@@ -288,18 +297,23 @@ func (m *Manager) handleCluster(w http.ResponseWriter, r *http.Request) {
 	for _, wc := range workers {
 		counts.Total++
 		switch wc.State() {
-		case workerStateOnline:
+		case contract.WorkerStateOnline:
 			counts.Online++
-		case workerStateDraining:
+		case contract.WorkerStatePressure:
+			counts.Pressured++
+		case contract.WorkerStateDraining:
 			counts.Draining++
-		case workerStateOffline:
+		case contract.WorkerStateOffline:
 			counts.Offline++
 		}
 
 		tc := wc.capacity
 		ac := int(wc.AvailableCapacity())
 		totalCap += tc
-		availCap += ac
+
+		if wc.state == contract.WorkerStateOnline {
+			availCap += ac
+		}
 
 		key := platformKey(wc.os, wc.arch)
 		if platformMap[key] == nil {
@@ -532,6 +546,96 @@ func (m *Manager) handleJobLogsStream(w http.ResponseWriter, r *http.Request) {
 						continue
 					}
 					data, _ := json.Marshal(map[string]string{"job_id": jobID, "line": line})
+					writeSSEEvent(w, "log", string(data))
+					flusher.Flush()
+				}
+			}
+		}()
+	}
+
+	<-ctx.Done()
+	writeSSEEvent(w, "done", "{}")
+	flusher.Flush()
+}
+
+// ---- /jobs/{id}/runs ----
+
+func (m *Manager) handleListJobRuns(w http.ResponseWriter, r *http.Request) {
+	jobID := r.PathValue("id")
+	if _, err := m.JobStore().GetJob(r.Context(), jobID); err != nil {
+		problemjson.NotFound(problemjson.Detail("job not found")).ServeHTTP(w, r)
+		return
+	}
+	runs, err := m.RunStore().ListJobRuns(r.Context(), jobID)
+	if err != nil {
+		problemjson.InternalServerError(problemjson.Detail("failed to list runs")).ServeHTTP(w, r)
+		return
+	}
+	if runs == nil {
+		runs = []*contract.JobRun{}
+	}
+	writeJSON(w, http.StatusOK, runs)
+}
+
+// ---- /jobs/{id}/runs/{runID}/logs ----
+
+func (m *Manager) handleRunLogs(w http.ResponseWriter, r *http.Request) {
+	runID := r.PathValue("runID")
+	rc, err := m.LogStore().GetRunLogReader(r.Context(), runID)
+	if err != nil {
+		problemjson.InternalServerError(problemjson.Detail("failed to read run logs")).ServeHTTP(w, r)
+		return
+	}
+	defer rc.Close()
+	w.Header().Set("Content-Type", "text/plain")
+	w.WriteHeader(http.StatusOK)
+	_, _ = io.Copy(w, rc)
+}
+
+// ---- /jobs/{id}/runs/{runID}/logs/stream (SSE) ----
+
+func (m *Manager) handleRunLogsStream(w http.ResponseWriter, r *http.Request) {
+	runID := r.PathValue("runID")
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		problemjson.InternalServerError(problemjson.Detail("streaming not supported")).ServeHTTP(w, r)
+		return
+	}
+
+	run, err := m.RunStore().GetRun(r.Context(), runID)
+	if err != nil {
+		problemjson.NotFound(problemjson.Detail("run not found")).ServeHTTP(w, r)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+
+	if run.Status == contract.RunStatusCompleted || run.Status == contract.RunStatusFailed {
+		rc, _ := m.LogStore().GetRunLogReader(r.Context(), runID)
+		if rc != nil {
+			emitLogLines(w, run.JobID, rc)
+			rc.Close()
+		}
+		writeSSEEvent(w, "done", "{}")
+		flusher.Flush()
+		return
+	}
+
+	ctx, cancel := context.WithCancel(r.Context())
+	defer cancel()
+
+	ch, err := m.LogStore().SubscribeRunLogs(ctx, runID)
+	if err == nil {
+		go func() {
+			for chunk := range ch {
+				for _, line := range strings.Split(strings.TrimRight(string(chunk), "\n"), "\n") {
+					if line == "" {
+						continue
+					}
+					data, _ := json.Marshal(map[string]string{"run_id": runID, "job_id": run.JobID, "line": line})
 					writeSSEEvent(w, "log", string(data))
 					flusher.Flush()
 				}

@@ -56,7 +56,7 @@ func (c *FSStoreConfig) setDefaults() {
 	}
 }
 
-// FSStore implements JobStore, TaskStore, LogStore, and WebhookStore with filesystem persistence.
+// FSStore implements JobStore, TaskStore, LogStore, RunStore, and WebhookStore with filesystem persistence.
 //
 // Reads are served from an in-memory hot state; read latency is identical to MemStore.
 // Writes update memory immediately and are journaled to disk asynchronously by a single
@@ -74,13 +74,15 @@ type FSStore struct {
 	mu       sync.RWMutex
 	jobs     map[string]*contract.Job
 	taskDefs map[string]*contract.Task // task definitions keyed by Task.Name
+	runs     map[string]*contract.JobRun
 	webhooks map[string]*webhooks.WebhookEntry
 
-	// Log state: per-job append handles and broadcast channels.
-	logMu       sync.Mutex
-	logHandles  map[string]*os.File // jobID → open O_APPEND handle
-	logBufs     map[string][]byte   // jobID → accumulated bytes (for SubscribeJobLogs)
-	subscribers map[string][]chan []byte
+	// Log state: per-run append handles and broadcast channels.
+	logMu          sync.Mutex
+	runLogHandles  map[string]*os.File // runID → open O_APPEND handle
+	runLogBufs     map[string][]byte   // runID → accumulated bytes
+	runSubscribers map[string][]chan []byte
+	jobSubscribers map[string][]chan []byte
 
 	// Journal channel: callers send entries; background writer drains.
 	journalCh chan journalEntry
@@ -100,20 +102,22 @@ func OpenFSStore(cfg FSStoreConfig) (*FSStore, error) {
 	if err := os.MkdirAll(cfg.Dir, 0o755); err != nil {
 		return nil, fmt.Errorf("fsstore: mkdir %s: %w", cfg.Dir, err)
 	}
-	if err := os.MkdirAll(filepath.Join(cfg.Dir, "logs"), 0o755); err != nil {
-		return nil, fmt.Errorf("fsstore: mkdir logs: %w", err)
+	if err := os.MkdirAll(filepath.Join(cfg.Dir, "logs", "runs"), 0o755); err != nil {
+		return nil, fmt.Errorf("fsstore: mkdir logs/runs: %w", err)
 	}
 
 	fs := &FSStore{
-		cfg:         cfg,
-		jobs:        make(map[string]*contract.Job),
-		taskDefs:    make(map[string]*contract.Task),
-		webhooks:    make(map[string]*webhooks.WebhookEntry),
-		logHandles:  make(map[string]*os.File),
-		logBufs:     make(map[string][]byte),
-		subscribers: make(map[string][]chan []byte),
-		journalCh:   make(chan journalEntry, cfg.JournalBufSize),
-		done:        make(chan struct{}),
+		cfg:            cfg,
+		jobs:           make(map[string]*contract.Job),
+		taskDefs:       make(map[string]*contract.Task),
+		runs:           make(map[string]*contract.JobRun),
+		webhooks:       make(map[string]*webhooks.WebhookEntry),
+		runLogHandles:  make(map[string]*os.File),
+		runLogBufs:     make(map[string][]byte),
+		runSubscribers: make(map[string][]chan []byte),
+		jobSubscribers: make(map[string][]chan []byte),
+		journalCh:      make(chan journalEntry, cfg.JournalBufSize),
+		done:           make(chan struct{}),
 	}
 
 	if err := fs.loadSnapshot(); err != nil {
@@ -142,7 +146,7 @@ func (fs *FSStore) Close() error {
 		fs.wg.Wait()
 
 		fs.logMu.Lock()
-		for _, f := range fs.logHandles {
+		for _, f := range fs.runLogHandles {
 			f.Close()
 		}
 		fs.logMu.Unlock()
@@ -199,7 +203,7 @@ func (fs *FSStore) ListJobs(_ context.Context, cursor string, limit int) ([]*con
 	fs.mu.RUnlock()
 
 	sort.Slice(all, func(i, j int) bool {
-		return all[i].CreatedAt.Before(all[j].CreatedAt)
+		return all[i].CreatedAt.After(all[j].CreatedAt)
 	})
 
 	start := 0
@@ -347,50 +351,93 @@ func (fs *FSStore) DeleteTask(_ context.Context, name string) error {
 
 // ---- LogStore ----
 
-func (fs *FSStore) AppendJobLog(_ context.Context, jobID string, data []byte) error {
+func (fs *FSStore) AppendRunLog(_ context.Context, runID string, data []byte) error {
 	fs.logMu.Lock()
-	f, err := fs.getOrOpenLogHandle(jobID)
+	f, err := fs.getOrOpenRunLogHandle(runID)
 	if err != nil {
 		fs.logMu.Unlock()
-		return fmt.Errorf("fsstore: open log handle for %s: %w", jobID, err)
+		return fmt.Errorf("fsstore: open run log handle for %s: %w", runID, err)
 	}
 
-	data = append(data, byte('\n'))
-
-	_, writeErr := f.Write(data)
+	line := append(data, '\n')
+	_, writeErr := f.Write(line)
 	if writeErr == nil {
-		fs.logBufs[jobID] = append(fs.logBufs[jobID], data...)
+		fs.runLogBufs[runID] = append(fs.runLogBufs[runID], line...)
 	}
-	subs := fs.subscribers[jobID]
+	runSubs := fs.runSubscribers[runID]
+
+	// Forward to job-level subscribers.
+	var jobSubs []chan []byte
+	fs.mu.RLock()
+	if run, ok := fs.runs[runID]; ok {
+		jobSubs = fs.jobSubscribers[run.JobID]
+	}
+	fs.mu.RUnlock()
+
 	fs.logMu.Unlock()
 
 	if writeErr != nil {
-		return fmt.Errorf("fsstore: write log for %s: %w", jobID, writeErr)
+		return fmt.Errorf("fsstore: write run log for %s: %w", runID, writeErr)
 	}
 
-	// Broadcast to live subscribers outside the lock.
-	chunk := make([]byte, len(data))
-	copy(chunk, data)
-	for _, ch := range subs {
+	chunk := make([]byte, len(line))
+	copy(chunk, line)
+	for _, ch := range runSubs {
 		select {
 		case ch <- chunk:
 		default:
-			// Slow subscriber; drop chunk rather than blocking the writer.
+		}
+	}
+	for _, ch := range jobSubs {
+		select {
+		case ch <- chunk:
+		default:
 		}
 	}
 	return nil
 }
 
-func (fs *FSStore) GetJobLogReader(_ context.Context, jobID string) (io.ReadCloser, error) {
-	logPath := filepath.Join(fs.cfg.Dir, "logs", jobID+".log")
+func (fs *FSStore) GetRunLogReader(_ context.Context, runID string) (io.ReadCloser, error) {
+	logPath := fs.runLogPath(runID)
 	f, err := os.Open(logPath)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return io.NopCloser(bytes.NewReader(nil)), nil
 		}
-		return nil, fmt.Errorf("fsstore: open log %s: %w", jobID, err)
+		return nil, fmt.Errorf("fsstore: open run log %s: %w", runID, err)
 	}
 	return f, nil
+}
+
+func (fs *FSStore) GetJobLogReader(ctx context.Context, jobID string) (io.ReadCloser, error) {
+	runs, err := fs.ListJobRuns(ctx, jobID)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(runs) == 0 {
+		// Migration fallback: check for legacy per-job log file.
+		legacyPath := filepath.Join(fs.cfg.Dir, "logs", jobID+".log")
+		if f, err := os.Open(legacyPath); err == nil {
+			return f, nil
+		}
+		return io.NopCloser(bytes.NewReader(nil)), nil
+	}
+
+	readers := make([]io.Reader, 0, len(runs))
+	closers := make([]io.Closer, 0, len(runs))
+	for _, run := range runs {
+		r, err := fs.GetRunLogReader(ctx, run.ID)
+		if err != nil {
+			for _, c := range closers {
+				c.Close()
+			}
+			return nil, err
+		}
+		readers = append(readers, r)
+		closers = append(closers, r)
+	}
+	return &multiReadCloser{Reader: io.MultiReader(readers...), closers: closers}, nil
 }
 
 func (fs *FSStore) GetRootJobLogReader(ctx context.Context, rootJobID string) (io.ReadCloser, error) {
@@ -422,22 +469,25 @@ func (fs *FSStore) SubscribeJobLogs(ctx context.Context, jobID string) (<-chan [
 	ch := make(chan []byte, 64)
 
 	fs.logMu.Lock()
-	// Pre-fill with any buffered log data accumulated since the job started.
-	if buf, ok := fs.logBufs[jobID]; ok && len(buf) > 0 {
-		snapshot := make([]byte, len(buf))
-		copy(snapshot, buf)
-		ch <- snapshot
+	// Pre-fill with any buffered run log data for this job.
+	runs, _ := fs.ListJobRuns(ctx, jobID)
+	for _, run := range runs {
+		if buf, ok := fs.runLogBufs[run.ID]; ok && len(buf) > 0 {
+			snapshot := make([]byte, len(buf))
+			copy(snapshot, buf)
+			ch <- snapshot
+		}
 	}
-	fs.subscribers[jobID] = append(fs.subscribers[jobID], ch)
+	fs.jobSubscribers[jobID] = append(fs.jobSubscribers[jobID], ch)
 	fs.logMu.Unlock()
 
 	go func() {
 		<-ctx.Done()
 		fs.logMu.Lock()
-		subs := fs.subscribers[jobID]
+		subs := fs.jobSubscribers[jobID]
 		for i, sub := range subs {
 			if sub == ch {
-				fs.subscribers[jobID] = append(subs[:i], subs[i+1:]...)
+				fs.jobSubscribers[jobID] = append(subs[:i], subs[i+1:]...)
 				break
 			}
 		}
@@ -448,15 +498,97 @@ func (fs *FSStore) SubscribeJobLogs(ctx context.Context, jobID string) (<-chan [
 	return ch, nil
 }
 
-// CloseJobLogSubscribers closes all subscriber channels for a job.
-// Call this when a job reaches a terminal state so SSE handlers exit cleanly.
-func (fs *FSStore) CloseJobLogSubscribers(jobID string) {
+func (fs *FSStore) SubscribeRunLogs(_ context.Context, runID string) (<-chan []byte, error) {
+	ch := make(chan []byte, 64)
+
+	fs.logMu.Lock()
+	if buf, ok := fs.runLogBufs[runID]; ok && len(buf) > 0 {
+		snapshot := make([]byte, len(buf))
+		copy(snapshot, buf)
+		ch <- snapshot
+	}
+	fs.runSubscribers[runID] = append(fs.runSubscribers[runID], ch)
+	fs.logMu.Unlock()
+
+	return ch, nil
+}
+
+// CloseRunLogSubscribers closes all subscriber channels for a run.
+func (fs *FSStore) CloseRunLogSubscribers(runID string) error {
 	fs.logMu.Lock()
 	defer fs.logMu.Unlock()
-	for _, ch := range fs.subscribers[jobID] {
+	for _, ch := range fs.runSubscribers[runID] {
 		close(ch)
 	}
-	delete(fs.subscribers, jobID)
+	delete(fs.runSubscribers, runID)
+
+	return nil
+}
+
+// CloseJobLogSubscribers closes all job-level subscriber channels.
+func (fs *FSStore) CloseJobLogSubscribers(jobID string) error {
+	fs.logMu.Lock()
+	defer fs.logMu.Unlock()
+	for _, ch := range fs.jobSubscribers[jobID] {
+		close(ch)
+	}
+	delete(fs.jobSubscribers, jobID)
+	return nil
+}
+
+// ---- RunStore ----
+
+func (fs *FSStore) CreateRun(_ context.Context, run *contract.JobRun) error {
+	fs.mu.Lock()
+	cp := *run
+	fs.runs[run.ID] = &cp
+	fs.mu.Unlock()
+	fs.journal(journalEntry{Op: opRunCreate, Data: mustMarshal(run)})
+	return nil
+}
+
+func (fs *FSStore) UpdateRun(_ context.Context, id string, mutate func(*contract.JobRun)) error {
+	fs.mu.Lock()
+	run, ok := fs.runs[id]
+	if !ok {
+		fs.mu.Unlock()
+		return fmt.Errorf("run %q not found", id)
+	}
+	mutate(run)
+	cp := *run
+	fs.mu.Unlock()
+	fs.journal(journalEntry{Op: opRunUpdate, Data: mustMarshal(&cp)})
+	return nil
+}
+
+func (fs *FSStore) GetRun(_ context.Context, id string) (*contract.JobRun, error) {
+	fs.mu.RLock()
+	defer fs.mu.RUnlock()
+	run, ok := fs.runs[id]
+	if !ok {
+		return nil, fmt.Errorf("run %q not found", id)
+	}
+	cp := *run
+	return &cp, nil
+}
+
+func (fs *FSStore) ListJobRuns(_ context.Context, jobID string) ([]*contract.JobRun, error) {
+	fs.mu.RLock()
+	defer fs.mu.RUnlock()
+	var out []*contract.JobRun
+	for _, r := range fs.runs {
+		if r.JobID == jobID {
+			cp := *r
+			out = append(out, &cp)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].StartedAt.IsZero() || out[j].StartedAt.IsZero() {
+			return out[i].Attempt < out[j].Attempt
+		}
+		return out[i].StartedAt.Before(out[j].StartedAt)
+	})
+	return out, nil
 }
 
 // ---- WebhookStore ----
@@ -518,19 +650,22 @@ func (fs *FSStore) journal(e journalEntry) {
 	}
 }
 
-// getOrOpenLogHandle returns the open *os.File for the given job's log, opening
+// getOrOpenRunLogHandle returns the open *os.File for the given run's log, opening
 // it in append mode on first access. Must be called with fs.logMu held.
-func (fs *FSStore) getOrOpenLogHandle(jobID string) (*os.File, error) {
-	if f, ok := fs.logHandles[jobID]; ok {
+func (fs *FSStore) getOrOpenRunLogHandle(runID string) (*os.File, error) {
+	if f, ok := fs.runLogHandles[runID]; ok {
 		return f, nil
 	}
-	logPath := filepath.Join(fs.cfg.Dir, "logs", jobID+".log")
-	f, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	f, err := os.OpenFile(fs.runLogPath(runID), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 	if err != nil {
 		return nil, err
 	}
-	fs.logHandles[jobID] = f
+	fs.runLogHandles[runID] = f
 	return f, nil
+}
+
+func (fs *FSStore) runLogPath(runID string) string {
+	return filepath.Join(fs.cfg.Dir, "logs", "runs", runID+".log")
 }
 
 // multiReadCloser wraps io.MultiReader and closes all underlying readers on Close.

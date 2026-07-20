@@ -59,6 +59,12 @@ func NewWebhookDispatcher(store WebhookStore, cfg *WebhookDispatcherConfig, logg
 	if logger == nil {
 		logger = slog.Default()
 	}
+	if cfg.WebhookTimeout <= 0 {
+		cfg.WebhookTimeout = time.Second
+	}
+	if cfg.WebhookMaxBackoff <= 0 {
+		cfg.WebhookMaxBackoff = 5 * time.Minute
+	}
 
 	return &WebhookDispatcher{
 		store:  store,
@@ -119,7 +125,7 @@ func (w *WebhookDispatcher) processPending(ctx context.Context) time.Duration {
 				"attempts", e.Attempts+1, "error", err)
 
 			next := w.scheduleRetry(ctx, e)
-			if nextWake.IsZero() || next.Before(nextWake) {
+			if !next.IsZero() && (nextWake.IsZero() || next.Before(nextWake)) {
 				nextWake = next
 			}
 		}
@@ -282,7 +288,9 @@ func (w *WebhookDispatcher) FireJobFailed(ctx context.Context, job *contract.Job
 }
 
 func (w *WebhookDispatcher) FireJobCompleted(ctx context.Context, job *contract.Job) {
-	w.enqueue(ctx, job, eventJobCompleted, nil)
+	w.enqueue(ctx, job, eventJobCompleted, map[string]any{
+		"result": job.Result,
+	})
 }
 
 func (w *WebhookDispatcher) FireJobCancelled(ctx context.Context, job *contract.Job) {

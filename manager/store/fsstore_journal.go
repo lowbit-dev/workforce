@@ -21,6 +21,8 @@ const (
 	opWebhookEnqueue journalOp = "webhook_enqueue"
 	opWebhookAck     journalOp = "webhook_ack"
 	opWebhookNack    journalOp = "webhook_nack"
+	opRunCreate      journalOp = "run_create"
+	opRunUpdate      journalOp = "run_update"
 )
 
 // journalEntry is one line in journal.jsonl.
@@ -106,6 +108,13 @@ func (fs *FSStore) applyJournalEntry(e journalEntry) error {
 			wh.Attempts = e.Attempts
 			wh.NextAttemptAt = e.NextAttemptAt
 		}
+
+	case opRunCreate, opRunUpdate:
+		var run contract.JobRun
+		if err := json.Unmarshal(e.Data, &run); err != nil {
+			return err
+		}
+		fs.runs[run.ID] = &run
 	}
 	return nil
 }

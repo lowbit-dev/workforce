@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"lowbit.dev/retry"
@@ -57,7 +58,8 @@ type Manager struct {
 
 	/* New */
 
-	dispatchSignal chan struct{}
+	lastDispatchRun atomic.Uint64
+	dispatchSignal  chan struct{}
 }
 
 // New validates cfg, applies defaults, and returns a ready Manager.
@@ -67,16 +69,23 @@ func New(cfg Config) (*Manager, error) {
 		return nil, err
 	}
 
+	cfg.Logger.Debug("[NewManager] Setting up signal...")
 	signal := make(chan struct{})
 
+	cfg.Logger.Debug("[NewManager] Setting up message registry...")
 	r := verreg.NewRegistry[contract.MessageFactory]()
 	contract.RegisterMessages(r)
+
+	cfg.Logger.Debug("[NewManager] Building flat message map...")
 	r.Build()
 
+	cfg.Logger.Debug("[NewManager] Setting up Manager structure...")
 	m := &Manager{
-		cfg:            cfg,
-		dispatchSignal: signal,
-		messageVerreg:  r,
+		cfg:           cfg,
+		messageVerreg: r,
+
+		lastDispatchRun: atomic.Uint64{},
+		dispatchSignal:  signal,
 		// pipe:           pipe,
 
 		cancelledJobIDs: *sets.NewSimpleSet[string](),
@@ -91,7 +100,10 @@ func New(cfg Config) (*Manager, error) {
 		}),
 	}
 
+	cfg.Logger.Debug("[NewManager] Setting up Worker Pool...")
 	m.workers = NewWorkerPool(cfg.Logger, signal, m.OnJobsRequeued)
+
+	cfg.Logger.Debug("[NewManager] Setting up Webhook Dispatcher...")
 	m.webhooks = webhooks.NewWebhookDispatcher(cfg.WebhookStore, cfg.Webhook, cfg.Logger)
 
 	// disp := newDispatcher(&cfg, h, cfg.Jobs, cfg.Tasks, cfg.Artifacts, webhooks, signer, cfg.Logger, signal)
@@ -99,12 +111,15 @@ func New(cfg Config) (*Manager, error) {
 
 	if len(cfg.ArtifactSigningKey) > 0 {
 		var err error
+
+		cfg.Logger.Debug("[NewManager] Setting up UrlSigner for artifacts...")
 		m.urlSigner, err = urlsign.NewSigner(cfg.ArtifactSigningKey, cfg.ArtifactSignedURLTTL)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create new artifact url signer: %w", err)
 		}
 	}
 
+	cfg.Logger.Debug("[NewManager] Setting up http routes...")
 	m.mux = m.buildMux()
 	return m, nil
 }
@@ -133,6 +148,24 @@ func (m *Manager) Run(ctx context.Context) error {
 		rungroup.WithRestartPolicy(rungroup.RestartAlways),
 	)
 
+	rg.Add(rungroup.NewIntervalService(60*time.Second, func(ctx context.Context) error {
+		if m.queue.Size() < 1 {
+			// Nothing in the queue so no need to trigger a process run for it
+			return nil
+		}
+
+		delta := uint64(time.Now().Unix()) - m.lastDispatchRun.Load()
+		if delta < 60 {
+			// Dispatcher processed the queue less than 60 seconds ago
+			return nil
+		}
+
+		m.Logger().Info("[Dispatcher][PeriodicTriggerRoutine] Triggering dispatcher queue work...", "delta", delta)
+		m.NotifyDispatcher()
+
+		return nil
+	}))
+
 	// rg.Add(m.webhooks,
 	// 	rungroup.WithName("WebhooksDispatcherRoutine"),
 	// 	rungroup.WithBackoff(retry.MaxAttempts(10, retry.Exponential(10*time.Second, 5*time.Minute))),
@@ -158,8 +191,22 @@ func (m *Manager) RecoverJobs(ctx context.Context) error {
 		return fmt.Errorf("recover: list recoverable jobs: %w", err)
 	}
 
-	// Reset recoverable jobs to Pending.
+	// Reset recoverable jobs to Pending and close any orphaned runs.
+	now := time.Now()
 	for _, j := range recoverable {
+		if m.cfg.RunStore != nil {
+			runs, _ := m.cfg.RunStore.ListJobRuns(ctx, j.ID)
+			for _, r := range runs {
+				if r.Status == contract.RunStatusProvisioning || r.Status == contract.RunStatusRunning {
+					_ = m.cfg.RunStore.UpdateRun(ctx, r.ID, func(run *contract.JobRun) {
+						run.Status = contract.RunStatusFailed
+						run.FailureReason = "recovered: manager restarted"
+						run.FinishedAt = now
+					})
+				}
+			}
+		}
+
 		err = m.JobStore().UpdateJob(ctx, j.ID, func(jb *contract.Job) {
 			jb.Status = contract.JobStatusPending
 		})
@@ -278,7 +325,22 @@ func (m *Manager) closeAllWorkers() {
 func (m *Manager) OnJobsRequeued(jobIDs []string) {
 	// Reset in-flight jobs to Pending and re-queue them.
 	ctx := context.Background()
+	now := time.Now()
 	for _, id := range jobIDs {
+		// Close any active run for this job.
+		if m.cfg.RunStore != nil {
+			runs, _ := m.cfg.RunStore.ListJobRuns(ctx, id)
+			for _, r := range runs {
+				if r.Status == contract.RunStatusProvisioning || r.Status == contract.RunStatusRunning {
+					_ = m.cfg.RunStore.UpdateRun(ctx, r.ID, func(run *contract.JobRun) {
+						run.Status = contract.RunStatusFailed
+						run.FailureReason = "worker disconnected"
+						run.FinishedAt = now
+					})
+				}
+			}
+		}
+
 		job, err := m.JobStore().GetJob(ctx, id)
 		if err != nil {
 			m.Logger().Error("[Manager] Re-queue job not found", "job_id", id, "error", err)
@@ -337,8 +399,12 @@ func (m *Manager) cancelJobByID(ctx context.Context, jobID string) {
 		}
 
 		_ = m.JobStore().UpdateJob(ctx, child.ID, func(j *contract.Job) {
+			cancelNow := time.Now()
+			cancelDuration := cancelNow.Sub(j.CreatedAt)
 			j.Status = contract.JobStatusCancelled
-			j.UpdatedAt = time.Now()
+			j.UpdatedAt = cancelNow
+			j.CompletedAt = &cancelNow
+			j.Duration = &cancelDuration
 		})
 	}
 
@@ -352,8 +418,12 @@ func (m *Manager) cancelJobByID(ctx context.Context, jobID string) {
 	}
 
 	err = m.JobStore().UpdateJob(ctx, jobID, func(j *contract.Job) {
+		cancelNow := time.Now()
+		cancelDuration := cancelNow.Sub(j.CreatedAt)
 		j.Status = contract.JobStatusCancelled
-		j.UpdatedAt = time.Now()
+		j.UpdatedAt = cancelNow
+		j.CompletedAt = &cancelNow
+		j.Duration = &cancelDuration
 	})
 
 	if err != nil {
@@ -385,6 +455,14 @@ func (m *Manager) SendCancelToWorker(jobID string) {
 // to stdin when the parent binary is re-invoked in consolidate phase.
 // Children are sorted by creation time to give a stable, deterministic order.
 func buildConsolidatePayload(parent *contract.Job, children []*contract.Job) (contract.JsonOrBytes, error) {
+	basePayload := parent.Payload
+	var previous contract.ConsolidatePayload
+	if len(parent.Payload) > 0 && json.Unmarshal(parent.Payload, &previous) == nil && previous.Payload != nil {
+		// If parent payload already is a consolidate payload, keep carrying forward
+		// the original payload to avoid nesting payload.payload.payload... across rounds.
+		basePayload = previous.Payload
+	}
+
 	sorted := make([]*contract.Job, len(children))
 	copy(sorted, children)
 	sort.Slice(sorted, func(i, j int) bool {
@@ -401,7 +479,7 @@ func buildConsolidatePayload(parent *contract.Job, children []*contract.Job) (co
 	}
 
 	jsonbytes, err := json.Marshal(contract.ConsolidatePayload{
-		Payload:  parent.Payload,
+		Payload:  basePayload,
 		Children: childResults,
 	})
 
@@ -515,4 +593,8 @@ func (m *Manager) TaskStore() TaskStore {
 
 func (m *Manager) LogStore() LogStore {
 	return m.cfg.LogStore
+}
+
+func (m *Manager) RunStore() RunStore {
+	return m.cfg.RunStore
 }

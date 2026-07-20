@@ -17,6 +17,7 @@ type snapshot struct {
 	Jobs      []*contract.Job          `json:"jobs"`
 	TaskDefs  []*contract.Task         `json:"task_defs"`
 	Webhooks  []*webhooks.WebhookEntry `json:"webhooks"`
+	Runs      []*contract.JobRun       `json:"runs"`
 }
 
 func (fs *FSStore) snapshotPath() string {
@@ -53,6 +54,10 @@ func (fs *FSStore) loadSnapshot() error {
 		cp := *e
 		fs.webhooks[e.ID] = &cp
 	}
+	for _, r := range snap.Runs {
+		cp := *r
+		fs.runs[r.ID] = &cp
+	}
 	return nil
 }
 
@@ -74,6 +79,7 @@ func (fs *FSStore) compact() error {
 		Jobs:      make([]*contract.Job, 0, len(fs.jobs)),
 		TaskDefs:  make([]*contract.Task, 0, len(fs.taskDefs)),
 		Webhooks:  make([]*webhooks.WebhookEntry, 0, len(fs.webhooks)),
+		Runs:      make([]*contract.JobRun, 0, len(fs.runs)),
 	}
 	for _, j := range fs.jobs {
 		cp := *j
@@ -86,6 +92,10 @@ func (fs *FSStore) compact() error {
 	for _, e := range fs.webhooks {
 		cp := *e
 		snap.Webhooks = append(snap.Webhooks, &cp)
+	}
+	for _, r := range fs.runs {
+		cp := *r
+		snap.Runs = append(snap.Runs, &cp)
 	}
 	fs.mu.RUnlock()
 

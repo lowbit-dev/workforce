@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"lowbit.dev/cooper"
@@ -28,10 +29,18 @@ var ErrManagerNil = errors.New("the manager instance is nil")
 
 type WorkerConnServer struct {
 	m *Manager
+
+	// activeRunIDs maps jobID → runID for jobs currently in-flight on this connection.
+	// Guarded by activeRunMu.
+	activeRunMu  sync.Mutex
+	activeRunIDs map[string]string
 }
 
 func NewWorkerConnServer(m *Manager) *WorkerConnServer {
-	return &WorkerConnServer{m: m}
+	return &WorkerConnServer{
+		m:            m,
+		activeRunIDs: make(map[string]string),
+	}
 }
 
 func (s *WorkerConnServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -167,6 +176,14 @@ func (s *WorkerConnServer) handleWorkerMessage(ctx context.Context, l *slog.Logg
 
 	switch msg := message.(type) {
 	case *contract.HeartbeatMessage:
+		l.Debug("[WorkerConnServer][handleWorkerMessage] Heartbeat received", "data", msg)
+		w.SetState(msg.State)
+
+		// TODO: this should probably become the host profile stuff,
+		// TODO: purely in memory tho, no persistance
+		w.cpuPercent.Store(msg.CPUPercent)
+		w.memPercent.Store(msg.MemoryPercent)
+
 		w.UpdateHeartbeat()
 		if err := w.Send("heartbeat"); err != nil {
 			l.Error("[WorkerConnServer][handleWorkerMessage] Failed to reply heartbeat to worker")
@@ -230,11 +247,39 @@ func (s *WorkerConnServer) handleAcceptMessage(ctx context.Context, l *slog.Logg
 	job, err := s.m.JobStore().GetJob(ctx, msg.JobID)
 	if err != nil {
 		l.Error("[WorkerConnServer][handleAcceptMessage] Failed to find job", "job_id", msg.JobID, "error", err)
-
 		return
 	}
 
-	if err := w.SendWithPayload(contract.FormulateDispatchV0Message(job), job.Payload); err != nil {
+	dispatchPayload, err := s.resolveDispatchPayload(ctx, job)
+	if err != nil {
+		l.Error("[WorkerConnServer][handleAcceptMessage] Failed to build dispatch payload", "job_id", msg.JobID, "phase", job.Phase, "error", err)
+		return
+	}
+
+	// Create a run record for this dispatch attempt.
+	runID := ulid.Make().String()
+	now := time.Now()
+	run := &contract.JobRun{
+		ID:           runID,
+		JobID:        job.ID,
+		Phase:        job.Phase,
+		Attempt:      job.Attempts + 1,
+		WorkerID:     w.workerID,
+		Status:       contract.RunStatusProvisioning,
+		ResultType:   contract.ResultSuccess,
+		InputPayload: dispatchPayload,
+	}
+	if err := s.m.RunStore().CreateRun(ctx, run); err != nil {
+		l.Error("[WorkerConnServer][handleAcceptMessage] Failed to create run", "job_id", job.ID, "error", err)
+		// Non-fatal: dispatch still proceeds; run tracking will be degraded.
+	}
+	_ = now
+
+	s.activeRunMu.Lock()
+	s.activeRunIDs[job.ID] = runID
+	s.activeRunMu.Unlock()
+
+	if err := w.SendWithPayload(contract.FormulateDispatchV0Message(job, runID), dispatchPayload); err != nil {
 		l.Error("[WorkerConnServer][handleAcceptMessage] Failed to write dispatch message to worker", "job_id", msg.JobID, "error", err)
 		return
 	}
@@ -283,6 +328,8 @@ func (s *WorkerConnServer) handleRejectMessage(ctx context.Context, l *slog.Logg
 	// TODO: Keep record (for a certain TTL) that this worker did reject the job proposal if its reason is not draining
 	// TODO: So we do not dispatch it to this worker again in the next round
 
+	w.rejectedJobsCache.Put(job.ID, struct{}{})
+
 	job.Status = contract.JobStatusPending
 	s.m.EnqueueJob(job)
 }
@@ -293,7 +340,6 @@ func (s *WorkerConnServer) handleStartingMessage(ctx context.Context, l *slog.Lo
 	job, err := s.m.JobStore().GetJob(ctx, msg.JobID)
 	if err != nil {
 		l.Error("[WorkerConnServer][handleStartingMessage] Failed to find job", "job_id", msg.JobID, "error", err)
-
 		return
 	}
 
@@ -304,6 +350,17 @@ func (s *WorkerConnServer) handleStartingMessage(ctx context.Context, l *slog.Lo
 
 	if err != nil {
 		l.Error("[WorkerConnServer][handleStartingMessage] Failed to update job", "job_id", msg.JobID, "error", err)
+	}
+
+	// Transition run from provisioning → running.
+	runID := s.resolveRunID(msg.JobID, msg.RunID)
+	if runID != "" {
+		if err := s.m.RunStore().UpdateRun(ctx, runID, func(r *contract.JobRun) {
+			r.Status = contract.RunStatusRunning
+			r.StartedAt = time.Now()
+		}); err != nil {
+			l.Error("[WorkerConnServer][handleStartingMessage] Failed to update run", "run_id", runID, "error", err)
+		}
 	}
 
 	if s.m.WebhookDispatcher() != nil {
@@ -330,6 +387,7 @@ func (s *WorkerConnServer) handleResultMessage(ctx context.Context, l *slog.Logg
 	if msg.Type == contract.ResultSubjobs {
 		// The Job emitted child jobs to be ran. The worker is finished at this point,
 		// so restore its capacity regardless of whether subjob handling succeeds.
+		runID := s.resolveRunID(msg.JobID, msg.RunID)
 		subjobErr := s.handleSubjobsEmitted(ctx, l, job, msg.Jobs)
 		if err := s.m.workers.restoreCapacity(ctx, w, job.ID, job.Cost); err != nil {
 			l.Error("[WorkerConnServer][handleResultMessage] Failed to restore worker capacity after subjobs", "job_id", job.ID, "error", err)
@@ -338,6 +396,10 @@ func (s *WorkerConnServer) handleResultMessage(ctx context.Context, l *slog.Logg
 			w.SendError("", subjobErr.Error())
 			return
 		}
+
+		// Close the run — the worker's work for this phase is done.
+		s.closeRun(ctx, l, runID, msg.JobID, contract.RunStatusCompleted, msg.Type, msg.Payload, "", 0)
+		return
 	}
 
 	if msg.Type == contract.ResultSuccess {
@@ -367,9 +429,13 @@ func (s *WorkerConnServer) handleSubjobsEmitted(ctx context.Context, l *slog.Log
 
 			// TODO: Add a sential for this specific case
 			return errors.Join(err, s.m.JobStore().UpdateJob(ctx, parent.ID, func(j *contract.Job) {
+				failNow := time.Now()
+				failDuration := failNow.Sub(j.CreatedAt)
 				j.Status = contract.JobStatusFailed
 				j.FailureReason = "child job targets unknown task: " + req.Task
-				j.UpdatedAt = time.Now()
+				j.UpdatedAt = failNow
+				j.CompletedAt = &failNow
+				j.Duration = &failDuration
 			}))
 		}
 
@@ -382,9 +448,13 @@ func (s *WorkerConnServer) handleSubjobsEmitted(ctx context.Context, l *slog.Log
 					l.Error("[WorkerConnServer][handleSubjobsEmitted] Failed to find child artifact version not found", "task", taskDef.Name, "version", req.Version)
 
 					return errors.Join(err, s.m.JobStore().UpdateJob(ctx, parent.ID, func(j *contract.Job) {
+						failNow := time.Now()
+						failDuration := failNow.Sub(j.CreatedAt)
 						j.Status = contract.JobStatusFailed
 						j.FailureReason = "child artifact " + req.Task + "@" + req.Version + " not found"
-						j.UpdatedAt = time.Now()
+						j.UpdatedAt = failNow
+						j.CompletedAt = &failNow
+						j.Duration = &failDuration
 					}))
 				}
 
@@ -396,9 +466,13 @@ func (s *WorkerConnServer) handleSubjobsEmitted(ctx context.Context, l *slog.Log
 					l.Error("[WorkerConnServer][handleSubjobsEmitted] No released artifact for child task", "task", taskDef.Name)
 
 					return errors.Join(err, s.m.JobStore().UpdateJob(ctx, parent.ID, func(j *contract.Job) {
+						failNow := time.Now()
+						failDuration := failNow.Sub(j.CreatedAt)
 						j.Status = contract.JobStatusFailed
 						j.FailureReason = "no released artifact for " + taskDef.Name
-						j.UpdatedAt = time.Now()
+						j.UpdatedAt = failNow
+						j.CompletedAt = &failNow
+						j.Duration = &failDuration
 					}))
 				}
 
@@ -424,9 +498,13 @@ func (s *WorkerConnServer) handleSubjobsEmitted(ctx context.Context, l *slog.Log
 			l.Error("[WorkerConnServer][handleSubjobsEmitted] Failed to save child job", "parent_job_id", parent.ID, "error", err)
 
 			return errors.Join(err, s.m.JobStore().UpdateJob(ctx, parent.ID, func(j *contract.Job) {
+				failNow := time.Now()
+				failDuration := failNow.Sub(j.CreatedAt)
 				j.Status = contract.JobStatusFailed
 				j.FailureReason = fmt.Sprintf("internal error saving child jobs: %s", err.Error())
-				j.UpdatedAt = time.Now()
+				j.UpdatedAt = failNow
+				j.CompletedAt = &failNow
+				j.Duration = &failDuration
 			}))
 		}
 
@@ -456,16 +534,28 @@ func (s *WorkerConnServer) handleJobCompleted(ctx context.Context, l *slog.Logge
 		return
 	}
 
+	if err := s.m.LogStore().CloseJobLogSubscribers(job.ID); err != nil {
+		l.Warn("[WorkerConnService] failed to close job log subscribers and flush the job logs", "job_id", job.ID, "error", err)
+	}
+
+	now := time.Now()
 	err := s.m.JobStore().UpdateJob(ctx, msg.JobID, func(j *contract.Job) {
+		duration := now.Sub(j.CreatedAt)
 		j.Status = contract.JobStatusCompleted
 		j.Result = msg.Payload
-		j.UpdatedAt = time.Now()
+		j.UpdatedAt = now
+		j.CompletedAt = &now
+		j.Duration = &duration
 	})
 
 	if err != nil {
 		l.Error("[WorkerConnServer][handleJobCompleted] Failed to update job", "job_id", msg.JobID, "error", err)
 		return
 	}
+
+	// Close the run record.
+	runID := s.resolveRunID(msg.JobID, msg.RunID)
+	s.closeRun(ctx, l, runID, msg.JobID, contract.RunStatusCompleted, msg.Type, msg.Payload, "", 0)
 
 	if err := s.m.workers.restoreCapacity(ctx, w, job.ID, job.Cost); err != nil {
 		l.Error("[WorkerConnServer][handleJobCompleted] Failed to restore worker capacity", "error", err)
@@ -504,23 +594,23 @@ func (s *WorkerConnServer) handleJobCompleted(ctx context.Context, l *slog.Logge
 
 	// All siblings completed — trigger consolidation.
 	parent, err := s.m.JobStore().GetJob(ctx, job.ParentJobID)
-	if err != nil || parent.Status != contract.JobStatusAwaitingChildren {
-		return
-	}
-
-	// Build the ConsolidatePayload: original payload + ordered child results.
-	consolidatePayload, err := buildConsolidatePayload(parent, siblings)
 	if err != nil {
-		l.Error("[WorkerConnServer][handleJobCompleted] Failed to build consolidation payload", "parent_job_id", parent.ID, "error", err)
 		return
 	}
 
 	// Reset job to Pending and re-queue.
+	// Guard this transition so only one sibling-completion handler can schedule
+	// consolidation for this wave of children.
+	var scheduled bool
 	err = s.m.JobStore().UpdateJob(ctx, parent.ID, func(j *contract.Job) {
+		if j.Status != contract.JobStatusAwaitingChildren {
+			return
+		}
+
 		j.Status = contract.JobStatusPending
 		j.Phase = "consolidate"
-		j.Payload = consolidatePayload
 		j.UpdatedAt = time.Now()
+		scheduled = true
 	})
 
 	if err != nil {
@@ -528,15 +618,23 @@ func (s *WorkerConnServer) handleJobCompleted(ctx context.Context, l *slog.Logge
 		return
 	}
 
+	if !scheduled {
+		return
+	}
+
 	parent.Status = contract.JobStatusPending
 	parent.Phase = contract.JobPhaseConsolidate
-	parent.Payload = consolidatePayload
 
 	s.m.EnqueueJob(parent)
 }
 
 func (s *WorkerConnServer) handleJobError(ctx context.Context, l *slog.Logger, w *WorkerConn, job *contract.Job, msg *contract.ResultMessage) {
 	if job.Status.IsTerminal() {
+		// Job was already cancelled. Still close the run so it doesn't stay in provisioning/running.
+		if job.Status == contract.JobStatusCancelled {
+			runID := s.resolveRunID(msg.JobID, msg.RunID)
+			s.closeRun(ctx, l, runID, msg.JobID, contract.RunStatusFailed, contract.ResultError, []byte("cancelled"), "cancelled", 0)
+		}
 		return
 	}
 
@@ -544,6 +642,10 @@ func (s *WorkerConnServer) handleJobError(ctx context.Context, l *slog.Logger, w
 	if err := s.m.workers.restoreCapacity(ctx, w, job.ID, job.Cost); err != nil {
 		l.Error("[WorkerConnServer][handleJobError] Failed to restore worker capacity", "error", err)
 	}
+
+	// Close the run record with failure details.
+	runID := s.resolveRunID(msg.JobID, msg.RunID)
+	s.closeRun(ctx, l, runID, msg.JobID, contract.RunStatusFailed, msg.Type, []byte(msg.Reason), msg.Reason, msg.ExitCode)
 
 	job.Attempts += 1
 	err := s.m.JobStore().UpdateJob(ctx, job.ID, func(j *contract.Job) {
@@ -609,9 +711,13 @@ func (s *WorkerConnServer) handleJobError(ctx context.Context, l *slog.Logger, w
 
 func (s *WorkerConnServer) handleFailJob(ctx context.Context, l *slog.Logger, job *contract.Job, msg *contract.ResultMessage) {
 	// Permanently failed.
+	now := time.Now()
 	err := s.m.JobStore().UpdateJob(ctx, job.ID, func(j *contract.Job) {
+		duration := now.Sub(j.CreatedAt)
 		j.Status = contract.JobStatusFailed
-		j.UpdatedAt = time.Now()
+		j.UpdatedAt = now
+		j.CompletedAt = &now
+		j.Duration = &duration
 	})
 
 	if err != nil {
@@ -621,6 +727,10 @@ func (s *WorkerConnServer) handleFailJob(ctx context.Context, l *slog.Logger, jo
 	if s.m.WebhookDispatcher() != nil {
 		job.Status = contract.JobStatusFailed
 		s.m.WebhookDispatcher().FireJobFailed(ctx, job, msg.Reason)
+	}
+
+	if err := s.m.LogStore().CloseJobLogSubscribers(job.ID); err != nil {
+		l.Warn("[WorkerConnService] failed to close job log subscribers and flush the job logs", "job_id", job.ID, "error", err)
 	}
 
 	if job.ParentJobID == "" {
@@ -635,10 +745,18 @@ func (s *WorkerConnServer) handleFailJob(ctx context.Context, l *slog.Logger, jo
 		return
 	}
 
+	if err := s.m.LogStore().CloseJobLogSubscribers(parent.ID); err != nil {
+		l.Warn("[WorkerConnService] failed to close job log subscribers and flush the job logs", "job_id", parent.ID, "error", err)
+	}
+
+	parentNow := time.Now()
 	err = s.m.JobStore().UpdateJob(ctx, parent.ID, func(j *contract.Job) {
+		parentDuration := parentNow.Sub(j.CreatedAt)
 		j.Status = contract.JobStatusFailed
 		j.FailureReason = msg.Reason
-		j.UpdatedAt = time.Now()
+		j.UpdatedAt = parentNow
+		j.CompletedAt = &parentNow
+		j.Duration = &parentDuration
 	})
 
 	if err != nil {
@@ -655,8 +773,12 @@ func (s *WorkerConnServer) handleFailJob(ctx context.Context, l *slog.Logger, jo
 func (s *WorkerConnServer) handleLogMessage(ctx context.Context, l *slog.Logger, w *WorkerConn, msg *contract.LogMessage) {
 	l.Debug("[WorkerConnServer][handleLogMessage] Worker provided log line", "job_id", msg.JobID)
 
-	if err := s.m.LogStore().AppendJobLog(ctx, msg.JobID, msg.Line); err != nil {
-		l.Error("[WorkerConnServer][handleLogMessage] Failed to store log line submission", "job_id", msg.JobID, "error", err)
+	runID := s.resolveRunID(msg.JobID, msg.RunID)
+	if runID == "" {
+		return
+	}
+	if err := s.m.LogStore().AppendRunLog(ctx, runID, msg.Line); err != nil {
+		l.Error("[WorkerConnServer][handleLogMessage] Failed to store log line submission", "job_id", msg.JobID, "run_id", runID, "error", err)
 	}
 }
 
@@ -690,4 +812,64 @@ func retryDelay(p contract.RetryPolicy, attempt int) time.Duration {
 		delay = p.MaxRetryDelay
 	}
 	return delay
+}
+
+// resolveRunID returns the run ID for a job. It prefers the value echoed by the worker
+// (msgRunID) and falls back to the in-flight map maintained by this server.
+func (s *WorkerConnServer) resolveRunID(jobID, msgRunID string) string {
+	if msgRunID != "" {
+		return msgRunID
+	}
+	s.activeRunMu.Lock()
+	id := s.activeRunIDs[jobID]
+	s.activeRunMu.Unlock()
+	return id
+}
+
+func (s *WorkerConnServer) resolveDispatchPayload(ctx context.Context, job *contract.Job) (contract.JsonOrBytes, error) {
+	if job.Phase != contract.JobPhaseConsolidate {
+		return job.Payload, nil
+	}
+
+	children, err := s.m.JobStore().ListChildJobs(ctx, job.ID)
+	if err != nil {
+		return nil, err
+	}
+
+	return buildConsolidatePayload(job, children)
+}
+
+// closeRun finalises a run record and removes it from the active map.
+// It appends a failure-reason log line when status is failed.
+func (s *WorkerConnServer) closeRun(ctx context.Context, l *slog.Logger, runID, jobID string, status contract.RunStatus, resultType contract.ResultType, outputPayload contract.JsonOrBytes, reason string, exitCode int) {
+	if runID == "" {
+		return
+	}
+
+	s.activeRunMu.Lock()
+	delete(s.activeRunIDs, jobID)
+	s.activeRunMu.Unlock()
+
+	if status == contract.RunStatusFailed && reason != "" {
+		logLine := []byte("[workforce] run failed: " + reason)
+		if err := s.m.LogStore().AppendRunLog(ctx, runID, logLine); err != nil {
+			l.Error("[WorkerConnServer][closeRun] Failed to append failure log", "run_id", runID, "error", err)
+		}
+	}
+
+	now := time.Now()
+	if err := s.m.RunStore().UpdateRun(ctx, runID, func(r *contract.JobRun) {
+		r.Status = status
+		r.ResultType = resultType
+		r.OutputPayload = outputPayload
+		r.FailureReason = reason
+		r.ExitCode = exitCode
+		r.FinishedAt = now
+	}); err != nil {
+		l.Error("[WorkerConnServer][closeRun] Failed to update run", "run_id", runID, "error", err)
+	}
+
+	if err := s.m.LogStore().CloseRunLogSubscribers(runID); err != nil {
+		l.Warn("[WorkerConnService] failed to close run log subscribers and flush the run logs", "run_id", runID, "error", err)
+	}
 }

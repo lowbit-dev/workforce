@@ -43,19 +43,42 @@ type TaskStore interface {
 	DeleteTask(ctx context.Context, name string) error
 }
 
+// RunStore persists JobRun execution attempt records.
+type RunStore interface {
+	CreateRun(ctx context.Context, run *contract.JobRun) error
+	UpdateRun(ctx context.Context, id string, mutate func(*contract.JobRun)) error
+	GetRun(ctx context.Context, id string) (*contract.JobRun, error)
+	ListJobRuns(ctx context.Context, jobID string) ([]*contract.JobRun, error)
+}
+
 // LogStore is an append-only log store for job output.
 // Logs are never loaded into memory as a whole; readers stream bytes directly to HTTP responses.
 type LogStore interface {
-	// AppendJobLog appends a chunk of log output to the job's append-only log stream.
-	AppendJobLog(ctx context.Context, jobID string, data []byte) error
-	// GetJobLogReader returns a reader over the full accumulated log for a job.
+	// AppendRunLog appends a chunk of log output to the given run's append-only log stream.
+	// It also forwards the chunk to any job-level subscribers so the existing SSE endpoint
+	// continues to work without change.
+	AppendRunLog(ctx context.Context, runID string, data []byte) error
+	// GetRunLogReader returns a reader over the full accumulated log for a single run.
+	GetRunLogReader(ctx context.Context, runID string) (io.ReadCloser, error)
+	// GetJobLogReader composes all run logs for jobID in StartedAt order.
+	// Falls back to the legacy per-job log file if no runs exist (migration path).
 	GetJobLogReader(ctx context.Context, jobID string) (io.ReadCloser, error)
 	// GetRootJobLogReader returns a reader over the concatenated logs for all jobs in a job tree,
 	// ordered by job creation time. Used for the root-level log endpoint.
 	GetRootJobLogReader(ctx context.Context, rootJobID string) (io.ReadCloser, error)
 	// SubscribeJobLogs returns a channel that receives log chunks in real time as they arrive.
-	// The channel is closed when the job reaches a terminal state or ctx is cancelled.
+	// The channel multiplexes across all runs for the job: new runs automatically forward
+	// their chunks here. Closed when ctx is cancelled.
 	SubscribeJobLogs(ctx context.Context, jobID string) (<-chan []byte, error)
+	// SubscribeRunLogs returns a channel that receives log chunks for a specific run only.
+	// Closed when ctx is cancelled or when the run reaches a terminal state.
+	SubscribeRunLogs(ctx context.Context, runID string) (<-chan []byte, error)
+	// CloseRunLogSubscribers closes all subscriber channels for a run and flushes any
+	// buffered log data to durable storage. Call when a run reaches a terminal state.
+	CloseRunLogSubscribers(runID string) error
+	// CloseJobLogSubscribers closes all job-level subscriber channels.
+	// Call when a job reaches a terminal state so SSE handlers exit cleanly.
+	CloseJobLogSubscribers(jobID string) error
 }
 
 type ExitCodeRange struct {
@@ -70,6 +93,7 @@ type Config struct {
 	JobStore          JobStore
 	TaskStore         TaskStore
 	LogStore          LogStore
+	RunStore          RunStore
 	WebhookStore      webhooks.WebhookStore
 	ArtifactsRegistry artifact.ArtifactRegistry
 
@@ -231,6 +255,10 @@ func (c *Config) validate() error {
 
 	if c.LogStore == nil {
 		return errors.New("Logs store is required")
+	}
+
+	if c.RunStore == nil {
+		return errors.New("Run store is required")
 	}
 
 	if c.WebhookStore == nil {

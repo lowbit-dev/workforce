@@ -13,6 +13,7 @@ import (
 	"lowbit.dev/rungroup"
 	"lowbit.dev/seriallane"
 	"lowbit.dev/ulid"
+	"lowbit.dev/workforce/contract"
 )
 
 // hub manages all connected WorkerConns and indexes them by platform for efficient dispatch.
@@ -118,7 +119,9 @@ func (p *WorkerPool) GetWorker(id string) (*WorkerConn, bool) {
 // whose availableCapacity >= cost, in stable sequential order.
 // If platforms is empty, all online workers with sufficient capacity are returned.
 // If cost == 0, all matching workers are returned regardless of available capacity.
-func (h *WorkerPool) eligibleWorkers(platforms []string, cost int) []*WorkerConn {
+func (h *WorkerPool) eligibleWorkers(platforms []string, cost int, jobID string) []*WorkerConn {
+	h.logger.Debug("[WorkerPool][eligibleWorkers] Finding eligible workers", "platforms", platforms, "cost", cost, "jobID", jobID)
+
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 
@@ -131,8 +134,14 @@ func (h *WorkerPool) eligibleWorkers(platforms []string, cost int) []*WorkerConn
 	if len(platforms) == 0 {
 		// No platform constraint — iterate all workers.
 		for _, w := range h.workers {
-			if !w.IsInState(workerStateOnline) {
+			if !w.IsInState(contract.WorkerStateOnline) {
 				continue
+			}
+
+			if jobID != "" {
+				if _, alreadyRejected := w.rejectedJobsCache.Get(jobID); alreadyRejected {
+					continue
+				}
 			}
 
 			if cost == 0 || w.AvailableCapacity() >= cost {
@@ -145,8 +154,14 @@ func (h *WorkerPool) eligibleWorkers(platforms []string, cost int) []*WorkerConn
 
 	for _, key := range platforms {
 		for _, w := range h.platform[key] {
-			if !w.IsInState(workerStateOnline) {
+			if !w.IsInState(contract.WorkerStateOnline) {
 				continue
+			}
+
+			if jobID != "" {
+				if _, alreadyRejected := w.rejectedJobsCache.Get(jobID); alreadyRejected {
+					continue
+				}
 			}
 
 			if cost == 0 || w.AvailableCapacity() >= cost {
@@ -308,7 +323,7 @@ func (h *WorkerPool) StaleWorkerMonitoringService(opts StaleWorkerMonitoringServ
 		for _, w := range workers {
 			// Only notify when the worker is fully idle (available == declared capacity).
 			// Or its not currently online (draining or offline)
-			if w.AvailableCapacity() < w.capacity || !w.IsInState(workerStateOnline) {
+			if w.AvailableCapacity() < w.capacity || !w.IsInState(contract.WorkerStateOnline) {
 				continue
 			}
 

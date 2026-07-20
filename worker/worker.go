@@ -126,7 +126,7 @@ func (c *Config) applyDefaults() {
 	}
 
 	if c.ResourceLimits.SampleInterval == 0 {
-		c.ResourceLimits.SampleInterval = 5 * time.Second
+		c.ResourceLimits.SampleInterval = 2 * time.Second
 	}
 
 	if c.ReconnectMaxAttempts == 0 {
@@ -156,22 +156,24 @@ type Worker struct {
 	depCache   map[string]struct{}
 
 	// Connection-scoped — reset at the start of each connectAndServe.
-	state atomicState
+	state contract.AtomicWorkerState
 	conn  net.Conn
 	done  chan struct{} // closed on planned exit (drain/shutdown)
 
-	tasksMu          sync.Mutex
-	tasks            map[string]*activeTask
-	pendingJobs      map[string]*contract.ProposeMessage // accepted, awaiting dispatch; protected by tasksMu
-	usedCap          int                                 // sum of costs of all running tasks; protected by tasksMu
-	lastHeartbeatAck atomic.Int64                        // unix nanos of last heartbeat echo
-	sendMu           sync.Mutex
+	tasksMu                   sync.Mutex
+	tasks                     map[string]*activeTask
+	pendingJobs               map[string]*contract.ProposeMessage // accepted, awaiting dispatch; protected by tasksMu
+	usedCap                   int                                 // sum of costs of all running tasks; protected by tasksMu
+	lastHeartbeatAck          atomic.Int64                        // unix nanos of last heartbeat echo
+	heartbeatSendFaulureCount atomic.Int32
+	sendMu                    sync.Mutex
 }
 
 // activeTask tracks one running job binary.
 type activeTask struct {
 	cancel context.CancelFunc
-	cost   int // capacity units consumed; returned to the pool in taskFinished
+	cost   int    // capacity units consumed; returned to the pool in taskFinished
+	runID  string // run identifier echoed from DispatchMessage
 }
 
 // New validates cfg, applies defaults, and returns a ready Worker.
@@ -187,13 +189,17 @@ func New(cfg Config) (*Worker, error) {
 	contract.RegisterMessages(r)
 	r.Build()
 
+	state := contract.AtomicWorkerState{}
+	state.Store(contract.WorkerStateOffline)
+
 	return &Worker{
 		cfg:            cfg,
 		artifactCache:  c,
-		metricsSampler: newMetricsSampler(cfg.ResourceLimits.SampleInterval, cfg.Logger),
+		metricsSampler: newMetricsSampler(cfg.ResourceLimits.SampleInterval, cfg.ResourceLimits.SampleInterval/2, cfg.Logger),
 
 		messageVerreg: r,
 		depCache:      make(map[string]struct{}),
+		state:         state,
 	}, nil
 }
 
@@ -239,7 +245,7 @@ func (w *Worker) Run(ctx context.Context) error {
 func (w *Worker) ConnectAndWorkRoutine(ctx context.Context) error {
 	err := w.ConnectAndWork(ctx)
 
-	if w.state.load() == stateShuttingDown || ctx.Err() != nil || err == nil {
+	if w.state.Is(contract.WorkerStateShuttingDown) || ctx.Err() != nil || err == nil {
 		return rungroup.ErrShutdownAll
 	}
 
@@ -254,7 +260,7 @@ func (w *Worker) ConnectAndWorkRoutine(ctx context.Context) error {
 // run attempts one connection. On an unexpected disconnect it backs off and calls itself
 // with attempt+1. On a planned exit or context cancellation it returns nil.
 func (w *Worker) ConnectAndWork(ctx context.Context) error {
-	w.state.store(stateOffline)
+	w.state.Store(contract.WorkerStateOffline)
 	w.done = make(chan struct{})
 	w.tasks = make(map[string]*activeTask)
 	w.pendingJobs = make(map[string]*contract.ProposeMessage)
@@ -291,7 +297,7 @@ func (w *Worker) ConnectAndWork(ctx context.Context) error {
 	defer func() { w.conn = nil }()
 
 	w.lastHeartbeatAck.Store(time.Now().UnixNano())
-	w.state.store(stateOnline)
+	w.state.Store(contract.WorkerStateOnline)
 
 	reader := netargv.NewReader(w.conn)
 	for msg, err := range reader.Itterate(ctx) {
@@ -326,18 +332,43 @@ func (w *Worker) HeartbeatRoutine(ctx context.Context) error {
 		return nil
 	}
 
-	if time.Since(time.Unix(0, w.lastHeartbeatAck.Load())) > w.cfg.HeartbeatTimeout {
-		w.cfg.Logger.Warn("[Worker][HeartbeatRoutine] Heartbeat timed-out. Closing connection...", "worker_id", w.cfg.WorkerID)
+	delta := time.Now().Unix() - w.lastHeartbeatAck.Load()
+	if delta > int64(w.cfg.HeartbeatTimeout.Seconds()) {
+		w.cfg.Logger.Warn("[Worker][HeartbeatRoutine] Heartbeat timed-out, did not recieve heartbeat from manager within timout window. Closing connection...", "worker_id", w.cfg.WorkerID, "delta", delta)
 		_ = w.conn.Close()
 
 		return rungroup.ErrShutdownAll
 	}
 
-	if err := w.send("heartbeat"); err != nil {
-		w.cfg.Logger.Warn("[Worker][HeartbeatRoutine] Failed to send heartbeat", "error", err)
-		_ = w.conn.Close()
+	w.cfg.Logger.Debug("[HeartbeatRoutine] Obtaining metrics snapshot")
+	metrics := w.metricsSampler.snapshot()
 
-		return rungroup.ErrShutdownAll
+	w.cfg.Logger.Debug("[HeartbeatRoutine] Updating state based on metrics", "metrics", metrics)
+	if w.state.Is(contract.WorkerStateOnline) || w.state.Is(contract.WorkerStatePressure) {
+		if metrics.IsOverLimit(w.cfg.ResourceLimits.MaxCPUPercent, w.cfg.ResourceLimits.MaxMemPercent) {
+			w.state.Store(contract.WorkerStatePressure)
+		} else {
+			w.state.Store(contract.WorkerStateOnline)
+		}
+	}
+
+	msg := fmt.Sprintf("heartbeat --cpu=%.2f --mem=%.2f --state=%d", metrics.CPUPercent, metrics.MemPercent, w.state.Load())
+	w.cfg.Logger.Debug("[HeartbeatRoutine] Attempting to send heartbeat", "msg", msg)
+
+	if err := w.send(msg); err != nil {
+		w.cfg.Logger.Warn("[Worker][HeartbeatRoutine] Failed to send heartbeat", "error", err)
+		totalConsecutiveFaulures := w.heartbeatSendFaulureCount.Add(1)
+
+		if totalConsecutiveFaulures >= 3 {
+			w.cfg.Logger.Warn("[Worker][HeartbeatRoutine] Failed to send heartbeat 3 times in a row. Colsing Connection...", "error", err)
+			_ = w.conn.Close()
+		}
+
+		return err
+	}
+
+	if w.heartbeatSendFaulureCount.Load() > 0 {
+		w.heartbeatSendFaulureCount.Add(-1)
 	}
 
 	return nil

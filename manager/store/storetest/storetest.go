@@ -15,6 +15,7 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"strings"
 	"testing"
 	"time"
 
@@ -263,8 +264,14 @@ func RunTaskStoreTests(t *testing.T, factory func() manager.TaskStore) {
 	})
 }
 
-// RunLogStoreTests runs compliance tests against a LogStore factory.
-func RunLogStoreTests(t *testing.T, factory func() manager.LogStore) {
+// logRunStoreFactory creates a store that implements both LogStore and RunStore.
+type logRunStore interface {
+	manager.LogStore
+	manager.RunStore
+}
+
+// RunLogStoreTests runs compliance tests against a LogStore + RunStore factory.
+func RunLogStoreTests(t *testing.T, factory func() logRunStore) {
 	t.Helper()
 
 	t.Run("AppendAndRead", func(t *testing.T) {
@@ -272,26 +279,55 @@ func RunLogStoreTests(t *testing.T, factory func() manager.LogStore) {
 		s := factory()
 		ctx := context.Background()
 
-		_ = s.AppendJobLog(ctx, "job-log-1", []byte("hello "))
-		_ = s.AppendJobLog(ctx, "job-log-1", []byte("world"))
+		// Create a run and append logs against it.
+		run := &contract.JobRun{ID: "run-log-1", JobID: "job-log-1", Status: contract.RunStatusRunning}
+		_ = s.CreateRun(ctx, run)
 
-		r, err := s.GetJobLogReader(ctx, "job-log-1")
+		_ = s.AppendRunLog(ctx, "run-log-1", []byte("hello "))
+		_ = s.AppendRunLog(ctx, "run-log-1", []byte("world"))
+
+		r, err := s.GetRunLogReader(ctx, "run-log-1")
+		if err != nil {
+			t.Fatalf("GetRunLogReader: %v", err)
+		}
+		defer r.Close()
+		got, _ := io.ReadAll(r)
+		// Normalise: FSStore appends a newline per entry; strip them for comparison.
+		gotNorm := strings.ReplaceAll(string(got), "\n", "")
+		if gotNorm != "hello world" {
+			t.Errorf("log content: got %q, want %q", got, "hello world")
+		}
+	})
+
+	t.Run("GetJobLogReaderComposesRuns", func(t *testing.T) {
+		t.Helper()
+		s := factory()
+		ctx := context.Background()
+
+		run1 := &contract.JobRun{ID: "run-a", JobID: "job-multi", Status: contract.RunStatusFailed}
+		run2 := &contract.JobRun{ID: "run-b", JobID: "job-multi", Status: contract.RunStatusCompleted}
+		_ = s.CreateRun(ctx, run1)
+		_ = s.CreateRun(ctx, run2)
+		_ = s.AppendRunLog(ctx, "run-a", []byte("attempt1"))
+		_ = s.AppendRunLog(ctx, "run-b", []byte("attempt2"))
+
+		r, err := s.GetJobLogReader(ctx, "job-multi")
 		if err != nil {
 			t.Fatalf("GetJobLogReader: %v", err)
 		}
 		defer r.Close()
 		got, _ := io.ReadAll(r)
-		if !bytes.Equal(got, []byte("hello world")) {
-			t.Errorf("log content: got %q, want %q", got, "hello world")
+		if !bytes.Contains(got, []byte("attempt1")) || !bytes.Contains(got, []byte("attempt2")) {
+			t.Errorf("expected both run logs, got %q", got)
 		}
 	})
 
 	t.Run("EmptyLog", func(t *testing.T) {
 		t.Helper()
 		s := factory()
-		r, err := s.GetJobLogReader(context.Background(), "nonexistent-job")
+		r, err := s.GetRunLogReader(context.Background(), "nonexistent-run")
 		if err != nil {
-			t.Fatalf("GetJobLogReader for nonexistent job: %v", err)
+			t.Fatalf("GetRunLogReader for nonexistent run: %v", err)
 		}
 		defer r.Close()
 		got, _ := io.ReadAll(r)
@@ -306,12 +342,15 @@ func RunLogStoreTests(t *testing.T, factory func() manager.LogStore) {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
 
-		ch, err := s.SubscribeJobLogs(ctx, "job-sub-1")
+		run := &contract.JobRun{ID: "run-sub-1", JobID: "job-sub-1", Status: contract.RunStatusRunning}
+		_ = s.CreateRun(ctx, run)
+
+		ch, err := s.SubscribeRunLogs(ctx, "run-sub-1")
 		if err != nil {
-			t.Fatalf("SubscribeJobLogs: %v", err)
+			t.Fatalf("SubscribeRunLogs: %v", err)
 		}
 
-		_ = s.AppendJobLog(ctx, "job-sub-1", []byte("chunk"))
+		_ = s.AppendRunLog(ctx, "run-sub-1", []byte("chunk"))
 
 		select {
 		case data, ok := <-ch:

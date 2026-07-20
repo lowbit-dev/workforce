@@ -17,7 +17,7 @@ func TestMemStoreTaskStore(t *testing.T) {
 }
 
 func TestMemStoreLogStore(t *testing.T) {
-	RunLogStoreTests(t, func() manager.LogStore { return store.NewMemStore() })
+	RunLogStoreTests(t, func() logRunStore { return store.NewMemStore() })
 }
 
 func TestMemStoreWebhookStore(t *testing.T) {

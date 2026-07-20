@@ -123,6 +123,7 @@ func (w *Worker) RunTask(ctx context.Context, t taskExec, logOutput io.Writer) (
 		childJobsW.Close()
 		return nil, nil, "", fmt.Errorf("runner: start: %w", err)
 	}
+
 	resultW.Close()
 	childJobsW.Close()
 
@@ -155,9 +156,11 @@ func exitCodeOf(err error) int {
 	if err == nil {
 		return 0
 	}
+
 	if ee, ok := err.(*exec.ExitError); ok {
 		return ee.ExitCode()
 	}
+
 	return 1
 }
 

@@ -7,11 +7,13 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"lowbit.dev/sets"
 	"lowbit.dev/topic"
 	"lowbit.dev/workforce/contract"
+	"lowbit.dev/workforce/manager/locksmith"
 )
 
 var (
@@ -23,15 +25,18 @@ var (
 type workerState int32
 
 const (
-	workerStateOnline   workerState = 0
-	workerStateDraining workerState = 1
-	workerStateOffline  workerState = 2
+	workerStateOnline workerState = iota
+	workerStatePressure
+	workerStateDraining
+	workerStateOffline
 )
 
 func (s workerState) String() string {
 	switch s {
 	case workerStateOnline:
 		return "online"
+	case workerStatePressure:
+		return "pressure"
 	case workerStateDraining:
 		return "draining"
 	case workerStateOffline:
@@ -65,12 +70,16 @@ type WorkerConn struct {
 	// Mutable State
 	// ---------------------------------------------------------
 	mu               sync.RWMutex
-	state            workerState
+	state            contract.WorkerState
+	cpuPercent       atomic.Value
+	memPercent       atomic.Value
 	inFlight         sets.SimpleSet[string]
 	occupiedCost     int
 	lastIdleAt       time.Time
 	lastHeartbeat    time.Time
 	lastIdleNotified time.Time
+
+	rejectedJobsCache *locksmith.Cache[string, struct{}]
 
 	MessageReceivedBus *topic.Topic[contract.Message]
 }
@@ -78,16 +87,23 @@ type WorkerConn struct {
 func NewWorkerConn(id, os, arch string, capacity int, conn net.Conn) *WorkerConn {
 	now := time.Now()
 	return &WorkerConn{
-		workerID:           id,
-		os:                 os,
-		arch:               arch,
-		capacity:           capacity,
-		conn:               conn,
-		connectedAt:        now,
-		inFlight:           *sets.NewSimpleSet[string](),
-		state:              workerStateOnline,
-		lastIdleAt:         now,
-		lastHeartbeat:      now,
+		workerID:      id,
+		os:            os,
+		arch:          arch,
+		capacity:      capacity,
+		conn:          conn,
+		connectedAt:   now,
+		inFlight:      *sets.NewSimpleSet[string](),
+		state:         contract.WorkerStateOnline,
+		lastIdleAt:    now,
+		lastHeartbeat: now,
+
+		rejectedJobsCache: locksmith.NewCache(
+			locksmith.WithLRU[string, struct{}](true),
+			locksmith.WithTTL[string, struct{}](60*time.Second),
+			locksmith.WithCapacity[string, struct{}](100),
+		),
+
 		MessageReceivedBus: topic.New[contract.Message](),
 	}
 }
@@ -97,7 +113,7 @@ func NewWorkerConn(id, os, arch string, capacity int, conn net.Conn) *WorkerConn
 // ---------------------------------------------------------
 
 // State requires an RLock because the state can change.
-func (w *WorkerConn) State() workerState {
+func (w *WorkerConn) State() contract.WorkerState {
 	w.mu.RLock()
 	defer w.mu.RUnlock()
 
@@ -105,7 +121,7 @@ func (w *WorkerConn) State() workerState {
 }
 
 // State requires an RLock because the state can change.
-func (w *WorkerConn) IsInState(state workerState) bool {
+func (w *WorkerConn) IsInState(state contract.WorkerState) bool {
 	w.mu.RLock()
 	defer w.mu.RUnlock()
 
@@ -113,7 +129,7 @@ func (w *WorkerConn) IsInState(state workerState) bool {
 }
 
 // SetState sets a new state for a worker
-func (w *WorkerConn) SetState(state workerState) {
+func (w *WorkerConn) SetState(state contract.WorkerState) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 

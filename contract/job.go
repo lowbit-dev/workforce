@@ -52,6 +52,8 @@ type Job struct {
 	WebhookHeaders map[string]string
 	CreatedAt      time.Time
 	UpdatedAt      time.Time
+	CompletedAt    *time.Time     // set once on terminal transition; nil while in-progress
+	Duration       *time.Duration // wall-clock duration from CreatedAt to CompletedAt; nil while in-progress
 }
 
 // ChildJobResult holds the task name and result of a single completed child job,
