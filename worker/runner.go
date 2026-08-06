@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -185,10 +186,18 @@ func IsExitError(err error) (code int, reason string, ok bool) {
 // TMPDIR is intentionally excluded; callers should set it to the task's rootDir.
 func SystemEnv() []string {
 	keys := []string{
-		"PATH",          // required for any subprocess the task spawns
-		"HOME",          // many tools write config/cache relative to HOME
-		"SSL_CERT_FILE", // system TLS trust bundle path (Linux)
-		"SSL_CERT_DIR",  // system TLS trust bundle directory (Linux)
+		"PATH",
+		"HOME",
+		"SSL_CERT_FILE",
+		"SSL_CERT_DIR",
+		// Windows stuff
+		"COMSPEC",
+		"SYSTEMROOT",
+		"USERPROFILE",
+		"HOMEDRIVE",
+		"HOMEPATH",
+		"TMP",
+		"TEMP",
 	}
 
 	env := make([]string, 0, len(keys))
@@ -199,4 +208,16 @@ func SystemEnv() []string {
 	}
 
 	return env
+}
+
+func EnvWithPrefix(prefix string) []string {
+	var result []string
+
+	for _, env := range os.Environ() {
+		if strings.HasPrefix(env, prefix) {
+			result = append(result, env)
+		}
+	}
+
+	return result
 }

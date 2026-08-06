@@ -10,7 +10,7 @@ import (
 	"lowbit.dev/rungroup"
 	"lowbit.dev/workforce/worker/window"
 
-	"github.com/shirou/gopsutil/cpu"
+	"github.com/shirou/gopsutil/v4/cpu"
 	"github.com/shirou/gopsutil/v4/mem"
 )
 

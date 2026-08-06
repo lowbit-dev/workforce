@@ -31,7 +31,7 @@ func Log() *slog.Logger {
 // during development — SubmitResult falls back to stdout with a clear visual
 // boundary so the result is still visible:
 //
-//	=== TASK RESULT ===
+//	=== RESULT =======
 //	{"status":"ok"}
 //	==================
 func SubmitResult(v any) error {
@@ -79,7 +79,7 @@ type ChildJob struct {
 // during development — EmitJobs falls back to stdout with a clear visual
 // boundary so the requests are still visible:
 //
-//	=== CHILD JOBS ===
+//	=== CHILD JOBS ======
 //	[{"task":"process","payload":{"id":1}}]
 //	==================
 func EmitJobs(jobs []ChildJob) error {

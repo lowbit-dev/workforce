@@ -42,13 +42,13 @@ func (w *Window[T]) Each(fn func(T)) {
 }
 
 // Average computes an average struct of type T.
-// It requires two callbacks to avoid reflection and allocations:
+// It requires two callbacks to stay zero alloc:
 // 1. add: dictates how to sum two structs together.
 // 2. divide: dictates how to divide the aggregated struct by the count.
 func (w *Window[T]) Average(add func(acc, next T) T, divide func(total T, count int) T) T {
 	var result T
 	if w.count == 0 {
-		return result // Returns the zero-value of T
+		return result
 	}
 
 	isFirst := true

@@ -149,7 +149,7 @@ func (w *Worker) runJob(ctx context.Context, proposal *contract.ProposeMessage, 
 			MaxCPUCores:      dispatch.MaxCPUCores,
 		},
 		Proc: ProcConfig{
-			Env: SystemEnv(),
+			Env: append(SystemEnv(), EnvWithPrefix(w.cfg.InheritableENVPrefix)...),
 		},
 	}
 

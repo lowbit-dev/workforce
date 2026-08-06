@@ -76,6 +76,10 @@ type Config struct {
 	// AuthToken is sent as a Bearer token in the Authorization header of POST /workers/connect.
 	AuthToken string
 
+	// InheritableENVPrefix defines the prefix for ENV variables which are inherited and passed to
+	// the task binaries ran through the worker
+	InheritableENVPrefix string
+
 	// ReconnectMaxAttempts is the maximum number of reconnect attempts. (Defaults to 10000).
 	ReconnectMaxAttempts int
 
@@ -136,6 +140,10 @@ func (c *Config) applyDefaults() {
 	if c.ConnectionRetryStrategy == nil {
 		c.ConnectionRetryStrategy = retry.Exponential(5*time.Second, 10*time.Minute)
 	}
+
+	if c.InheritableENVPrefix == "" {
+		c.InheritableENVPrefix = "WORKFORCE_WORKER_TASK_"
+	}
 }
 
 // Worker connects to a Manager and executes task binaries.
@@ -189,18 +197,19 @@ func New(cfg Config) (*Worker, error) {
 	contract.RegisterMessages(r)
 	r.Build()
 
-	state := contract.AtomicWorkerState{}
-	state.Store(contract.WorkerStateOffline)
-
-	return &Worker{
+	w := &Worker{
 		cfg:            cfg,
 		artifactCache:  c,
 		metricsSampler: newMetricsSampler(cfg.ResourceLimits.SampleInterval, cfg.ResourceLimits.SampleInterval/2, cfg.Logger),
 
 		messageVerreg: r,
 		depCache:      make(map[string]struct{}),
-		state:         state,
-	}, nil
+		state:         contract.AtomicWorkerState{},
+	}
+
+	w.state.Store(contract.WorkerStateOffline)
+
+	return w, nil
 }
 
 // Run connects to the Manager and processes tasks until ctx is cancelled or the
@@ -343,7 +352,6 @@ func (w *Worker) HeartbeatRoutine(ctx context.Context) error {
 	w.cfg.Logger.Debug("[HeartbeatRoutine] Obtaining metrics snapshot")
 	metrics := w.metricsSampler.snapshot()
 
-	w.cfg.Logger.Debug("[HeartbeatRoutine] Updating state based on metrics", "metrics", metrics)
 	if w.state.Is(contract.WorkerStateOnline) || w.state.Is(contract.WorkerStatePressure) {
 		if metrics.IsOverLimit(w.cfg.ResourceLimits.MaxCPUPercent, w.cfg.ResourceLimits.MaxMemPercent) {
 			w.state.Store(contract.WorkerStatePressure)
@@ -353,8 +361,6 @@ func (w *Worker) HeartbeatRoutine(ctx context.Context) error {
 	}
 
 	msg := fmt.Sprintf("heartbeat --cpu=%.2f --mem=%.2f --state=%d", metrics.CPUPercent, metrics.MemPercent, w.state.Load())
-	w.cfg.Logger.Debug("[HeartbeatRoutine] Attempting to send heartbeat", "msg", msg)
-
 	if err := w.send(msg); err != nil {
 		w.cfg.Logger.Warn("[Worker][HeartbeatRoutine] Failed to send heartbeat", "error", err)
 		totalConsecutiveFaulures := w.heartbeatSendFaulureCount.Add(1)

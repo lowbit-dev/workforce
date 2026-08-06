@@ -12,17 +12,21 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"sync"
 	"time"
+
+	"lowbit.dev/workforce/worker/sf"
 )
 
 // ArtifactCache is a local disk cache for content-addressed files downloaded from URLs.
 type ArtifactCache struct {
-	dir     string
-	maxSize int64
-	ttl     time.Duration
-	logger  *slog.Logger
+	dir      string
+	maxSize  int64
+	ttl      time.Duration
+	logger   *slog.Logger
+	inFlight sf.Group
 
 	mu      sync.Mutex
 	entries map[string]*entry
@@ -63,6 +67,14 @@ func (c *ArtifactCache) Fetch(ctx context.Context, hash, url string) (string, er
 		return path, nil
 	}
 
+	v, err, _ := c.inFlight.Do(hash, func() (any, error) {
+		return c.Obtain(ctx, hash, url)
+	})
+
+	return v.(string), err
+}
+
+func (c *ArtifactCache) Obtain(ctx context.Context, hash, url string) (string, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return "", fmt.Errorf("cache: build request: %w", err)
@@ -95,7 +107,12 @@ func (c *ArtifactCache) Fetch(ctx context.Context, hash, url string) (string, er
 		return "", fmt.Errorf("cache: integrity check failed (want %s, got %s)", hash, got)
 	}
 
-	dest := filepath.Join(c.dir, hash)
+	name := hash
+	if runtime.GOOS == "windows" {
+		name += ".exe"
+	}
+	dest := filepath.Join(c.dir, name)
+
 	if err := os.Rename(tmp.Name(), dest); err != nil {
 		os.Remove(tmp.Name())
 		return "", fmt.Errorf("cache: rename: %w", err)
