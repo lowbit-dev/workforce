@@ -303,7 +303,7 @@ func (h *WorkerPool) checkHeartbeats(timeout time.Duration) error {
 type StaleWorkerMonitoringServiceOptions struct {
 	interval              time.Duration // On what interval should the stale workers be checked
 	idleThreshold         time.Duration // How long should a worker be doing nothing to be considered idle
-	scaleDownCooldown     time.Duration // How long should a worker be marked as idle untill its considered stale
+	scaleDownCooldown     time.Duration // The min amount of time between IdleWorkerEvents for a given worker
 	hasPendingForPlatform func(os, arch string) bool
 	drainWorker           func(workerID string) error
 	drainWorkerAndWait    func(ctx context.Context, workerID string) error

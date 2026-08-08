@@ -149,9 +149,9 @@ func (m *Manager) Run(ctx context.Context) error {
 	)
 
 	rg.Add(m.workers.StaleWorkerMonitoringService(StaleWorkerMonitoringServiceOptions{
-		interval:          time.Minute * 15,
-		idleThreshold:     time.Minute * 30,
-		scaleDownCooldown: time.Minute * 25,
+		interval:          m.cfg.IdleWorkerEvaluationInterval,
+		idleThreshold:     m.cfg.IdleWorkerThreshold,
+		scaleDownCooldown: m.cfg.ScaleDownCooldown,
 
 		/* Callbacks for cluster mutations and introspection */
 		hasPendingForPlatform: m.HasPendingForPlatform,

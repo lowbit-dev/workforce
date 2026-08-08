@@ -106,10 +106,6 @@ type Config struct {
 	// Defaults to LeastLoadedSelector if nil.
 	WorkerSelector WorkerSelector
 
-	// IdleWorkerThreshold is how long a worker must be idle before OnIdleWorker is called.
-	// Default: 5m.
-	IdleWorkerThreshold time.Duration
-
 	// HeartbeatTimeout closes a worker connection if no heartbeat is received within this window.
 	// Default: 30s.
 	HeartbeatTimeout time.Duration
@@ -166,6 +162,10 @@ type Config struct {
 	// Prevents scale-up thrashing when demand fluctuates rapidly. Default: 30s.
 	ScaleUpCooldown time.Duration
 
+	// IdleWorkerThreshold is how long a worker must be idle before OnIdleWorker is called for that worker.
+	// Default: 5m.
+	IdleWorkerThreshold time.Duration
+
 	// OnIdleWorker is called when a worker has been idle past IdleWorkerThreshold.
 	// Receives an IdleWorkerEvent with platform and cluster context to guide scale-down decisions.
 	// Rate-limited per workerID by ScaleDownCooldown. Optional.
@@ -174,6 +174,9 @@ type Config struct {
 	// ScaleDownCooldown is the minimum interval between OnIdleWorker calls for the same workerID.
 	// Default: 60s.
 	ScaleDownCooldown time.Duration
+
+	// IdleWorkerEvaluationInterval defines the interval on which the idleness of workers is evaluated (Default: 15 min)
+	IdleWorkerEvaluationInterval time.Duration
 
 	DefaultPanicExitCode           uint8
 	DefaultDoNotRetryExitCodeRange ExitCodeRange
@@ -225,6 +228,10 @@ func (c *Config) applyDefaults() {
 
 	if c.ScaleDownCooldown == 0 {
 		c.ScaleDownCooldown = 60 * time.Second
+	}
+
+	if c.IdleWorkerEvaluationInterval == 0 {
+		c.IdleWorkerEvaluationInterval = 15 * time.Minute
 	}
 
 	if c.WorkerConnectPath == "" {
