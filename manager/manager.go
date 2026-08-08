@@ -148,6 +148,19 @@ func (m *Manager) Run(ctx context.Context) error {
 		rungroup.WithRestartPolicy(rungroup.RestartAlways),
 	)
 
+	rg.Add(m.workers.StaleWorkerMonitoringService(StaleWorkerMonitoringServiceOptions{
+		interval:          time.Minute * 15,
+		idleThreshold:     time.Minute * 30,
+		scaleDownCooldown: time.Minute * 25,
+
+		/* Callbacks for cluster mutations and introspection */
+		hasPendingForPlatform: m.HasPendingForPlatform,
+		drainWorker:           m.DrainWorker,
+		drainWorkerAndWait:    m.DrainWorkerAndWait,
+		disconnectWorker:      m.DisconnectWorker,
+		onIdle:                m.cfg.OnIdleWorker,
+	}))
+
 	rg.Add(rungroup.NewIntervalService(60*time.Second, func(ctx context.Context) error {
 		if m.queue.Size() < 1 {
 			// Nothing in the queue so no need to trigger a process run for it
@@ -223,6 +236,33 @@ func (m *Manager) RecoverJobs(ctx context.Context) error {
 	m.Logger().Info("[Workforce][Manager]: Recovered jobs", "pending", len(pending), "recovered", len(recoverable))
 
 	return nil
+}
+
+func (m *Manager) HasPendingForPlatform(os, arch string) bool {
+	taskNames := make(map[string]struct{}, m.queue.Len())
+	for _, e := range m.queue.Snapshot() {
+		taskNames[e.Value.TaskName] = struct{}{}
+	}
+
+	reg := m.ArtifactRegistry()
+	if reg == nil {
+		return len(taskNames) > 0
+	}
+
+	ctx := context.Background()
+	target := platformKey(os, arch)
+	for taskName := range taskNames {
+		platforms, err := reg.ListPlatforms(ctx, taskName, "")
+		if err != nil {
+			continue
+		}
+		for _, p := range platforms {
+			if platformKey(p.OS, p.Arch) == target {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // Stop initiates a graceful shutdown. It sends TYPE_SYSTEM_CONTROL{drain} to all

@@ -301,9 +301,9 @@ func (h *WorkerPool) checkHeartbeats(timeout time.Duration) error {
 }
 
 type StaleWorkerMonitoringServiceOptions struct {
-	timeout               time.Duration
-	idleThreshold         time.Duration
-	scaleDownCooldown     time.Duration
+	interval              time.Duration // On what interval should the stale workers be checked
+	idleThreshold         time.Duration // How long should a worker be doing nothing to be considered idle
+	scaleDownCooldown     time.Duration // How long should a worker be marked as idle untill its considered stale
 	hasPendingForPlatform func(os, arch string) bool
 	drainWorker           func(workerID string) error
 	drainWorkerAndWait    func(ctx context.Context, workerID string) error
@@ -312,7 +312,7 @@ type StaleWorkerMonitoringServiceOptions struct {
 }
 
 func (h *WorkerPool) StaleWorkerMonitoringService(opts StaleWorkerMonitoringServiceOptions) rungroup.Service {
-	return rungroup.NewIntervalService(opts.timeout/2, func(ctx context.Context) error {
+	return rungroup.NewIntervalService(opts.interval, func(ctx context.Context) error {
 		if opts.onIdle == nil || opts.idleThreshold <= 0 {
 			return fmt.Errorf("No onIdle callback or idleThreshold set: %w", rungroup.ErrDoNotRestart)
 		}

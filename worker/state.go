@@ -7,7 +7,7 @@ type state int32
 
 const (
 	stateOnline       state = iota // Connected; accepting proposals and running tasks.
-	statePressure                  //
+	statePressure                  // Not accepting new proposales; experiancing system pressure (cpu &| memory)
 	stateDraining                  // Not accepting new proposals; finishing in-progress tasks.
 	stateOffline                   // Not connected; reconnect loop active or exited.
 	stateShuttingDown              //
