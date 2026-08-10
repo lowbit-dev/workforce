@@ -100,7 +100,14 @@ func (w *Worker) handleSystem(msg *contract.SystemMessage) {
 	switch msg.Command {
 	case "drain":
 		w.state.Store(contract.WorkerStateDraining)
-		// TODO: maybe it would help if we actually drained here....
+		w.tasksMu.Lock()
+		remaining := len(w.tasks)
+
+		if remaining == 0 {
+			w.state.Store(contract.WorkerStateShuttingDown)
+			w.cfg.Logger.Info("[Worker][handleSystem] Drain completed (no active tasks. Closing connection...")
+			w.conn.Close()
+		}
 	case "shutdown":
 		if w.state.Transition(contract.WorkerStateOnline, contract.WorkerStateShuttingDown) || w.state.Transition(contract.WorkerStateDraining, contract.WorkerStateShuttingDown) {
 			close(w.done)
