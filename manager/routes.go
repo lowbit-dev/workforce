@@ -788,7 +788,7 @@ func (m *Manager) publishArtifact(w http.ResponseWriter, r *http.Request, artifa
 	}
 
 	r.Body = http.MaxBytesReader(w, r.Body, m.cfg.MaxArtifactUploadSize)
-	if err := r.ParseMultipartForm(32 << 20); err != nil {
+	if err := r.ParseMultipartForm(2 << 30); err != nil {
 		problemjson.BadRequest(problemjson.Error(err)).ServeHTTP(w, r)
 		return
 	}
