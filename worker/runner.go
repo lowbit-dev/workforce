@@ -104,6 +104,9 @@ func (w *Worker) RunTask(ctx context.Context, t taskExec, logOutput io.Writer) (
 		"WORKFORCE_TASK_TYPE="+t.TaskName,
 		"WORKFORCE_PARENT_JOB_ID="+t.ParentJobID,
 		fmt.Sprintf("WORKFORCE_ATTEMPT=%d", t.Attempt),
+
+		fmt.Sprintf("WORKFORCE_TMP_STORAGE_DIRECTORY=%s", w.cfg.TmpStorageDir),
+		fmt.Sprintf("WORKFORCE_TASK_STORAGE_DIRECTORY=%s", rootDir),
 	)
 
 	if t.Proc.Credential != nil {

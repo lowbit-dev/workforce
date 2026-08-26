@@ -63,6 +63,18 @@ type Config struct {
 	// CacheTTL evicts binaries not accessed within this window. Zero = no TTL eviction.
 	CacheTTL time.Duration
 
+	// TmpStorageDir is the path where the worker can manage tmp storage which should not be supervised by the kernel.
+	// This storage may be shared by tasks on the worker or be single task scoped.
+	// The worker will however enforce the TmpStorageMaxLifetime
+	TmpStorageDir string
+
+	// TmpStorageMaxLifetime defines the maximum lifetime of a file or directory stored in the TmpStorageDirectory. (Default 48 * Hour)
+	// Once a file or directort exeeds this lifetime the worker will unlink it.
+	TmpStorageMaxLifetime time.Duration
+
+	// TmpStorageCleanupInterval defines the interval in which the tmp storage locatioon will be cleaned up (Default: 3*Hour)
+	TmpStorageCleanupInterval time.Duration
+
 	// HeartbeatInterval governs how often the Worker sends TYPE_HEARTBEAT. Default: 10s.
 	HeartbeatInterval time.Duration
 
@@ -143,6 +155,14 @@ func (c *Config) applyDefaults() {
 
 	if c.InheritableENVPrefix == "" {
 		c.InheritableENVPrefix = "WORKFORCE_WORKER_TASK_"
+	}
+
+	if c.TmpStorageMaxLifetime == 0 {
+		c.TmpStorageMaxLifetime = 48 * time.Hour
+	}
+
+	if c.TmpStorageCleanupInterval == 0 {
+		c.TmpStorageCleanupInterval = 3 * time.Hour
 	}
 }
 
