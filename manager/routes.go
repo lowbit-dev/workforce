@@ -799,6 +799,7 @@ func (m *Manager) publishArtifact(w http.ResponseWriter, r *http.Request, artifa
 		return
 	}
 	preRelease := r.FormValue("pre_release") == "true"
+	ignoreIfExists := r.FormValue("ignore_if_exists") == "true"
 
 	// Collect per-platform dependency lists from "{platform}_deps" form values.
 	platformDeps := make(map[string][]string)
@@ -849,6 +850,10 @@ func (m *Manager) publishArtifact(w http.ResponseWriter, r *http.Request, artifa
 	}
 	if err := m.ArtifactRegistry().Publish(r.Context(), av, binaries); err != nil {
 		if errors.Is(err, artifact.ErrAlreadyExists) {
+			if ignoreIfExists {
+				w.WriteHeader(http.StatusOK)
+				return
+			}
 			problemjson.Conflict(problemjson.Detail("version already exists for this platform")).ServeHTTP(w, r)
 			return
 		}
