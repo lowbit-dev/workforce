@@ -539,23 +539,29 @@ func (m *Manager) handleJobLogsStream(w http.ResponseWriter, r *http.Request) {
 
 	ch, err := m.LogStore().SubscribeJobLogs(ctx, jobID)
 	if err == nil {
-		go func() {
-			for chunk := range ch {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case chunk, ok := <-ch:
+				if !ok {
+					writeSSEEvent(w, "done", "{}")
+					flusher.Flush()
+					return
+				}
 				for _, line := range strings.Split(strings.TrimRight(string(chunk), "\n"), "\n") {
 					if line == "" {
 						continue
 					}
 					data, _ := json.Marshal(map[string]string{"job_id": jobID, "line": line})
 					writeSSEEvent(w, "log", string(data))
-					flusher.Flush()
 				}
+				flusher.Flush()
 			}
-		}()
+		}
 	}
 
 	<-ctx.Done()
-	writeSSEEvent(w, "done", "{}")
-	flusher.Flush()
 }
 
 // ---- /jobs/{id}/runs ----
@@ -629,23 +635,29 @@ func (m *Manager) handleRunLogsStream(w http.ResponseWriter, r *http.Request) {
 
 	ch, err := m.LogStore().SubscribeRunLogs(ctx, runID)
 	if err == nil {
-		go func() {
-			for chunk := range ch {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case chunk, ok := <-ch:
+				if !ok {
+					writeSSEEvent(w, "done", "{}")
+					flusher.Flush()
+					return
+				}
 				for _, line := range strings.Split(strings.TrimRight(string(chunk), "\n"), "\n") {
 					if line == "" {
 						continue
 					}
 					data, _ := json.Marshal(map[string]string{"run_id": runID, "job_id": run.JobID, "line": line})
 					writeSSEEvent(w, "log", string(data))
-					flusher.Flush()
 				}
+				flusher.Flush()
 			}
-		}()
+		}
 	}
 
 	<-ctx.Done()
-	writeSSEEvent(w, "done", "{}")
-	flusher.Flush()
 }
 
 // ---- /jobs/{id}/children ----
