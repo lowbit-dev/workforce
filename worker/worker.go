@@ -273,14 +273,16 @@ func (w *Worker) Run(ctx context.Context) error {
 
 func (w *Worker) ConnectAndWorkRoutine(ctx context.Context) error {
 	err := w.ConnectAndWork(ctx)
+	slog.Error("[ConnectAndWorkRoutine] Error while performing work", "error", err)
 
 	if w.state.Is(contract.WorkerStateShuttingDown) || ctx.Err() != nil || err == nil {
-		return rungroup.ErrShutdownAll
+		w.cfg.Logger.Info("[ConnectAndWorkRoutine] Received Shutdown signal. Shutting down...")
+		return fmt.Errorf("%w: %w", rungroup.ErrShutdownAll, err)
 	}
 
 	if errors.Is(err, retry.ErrRetryLimitExceeded) {
-		w.cfg.Logger.Info("[Worker] Max reconnect attempts exhausted. Shutting down...")
-		return fmt.Errorf("%w: %w", err, rungroup.ErrShutdownAll)
+		w.cfg.Logger.Info("[ConnectAndWorkRoutine] Max reconnect attempts exhausted. Shutting down...")
+		return fmt.Errorf("%w: %w", rungroup.ErrShutdownAll, err)
 	}
 
 	return err
@@ -322,6 +324,7 @@ func (w *Worker) ConnectAndWork(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("failed to connect to manager: %w", err)
 	}
+
 	defer w.conn.Close()
 	defer func() { w.conn = nil }()
 
@@ -334,7 +337,8 @@ func (w *Worker) ConnectAndWork(ctx context.Context) error {
 			if errors.Is(err, io.EOF) {
 				return nil
 			}
-			return err
+
+			return fmt.Errorf("failed to read message from stream: %w", err)
 		}
 
 		factory, err := w.messageVerreg.Resolve(worforceProtocolVersion, msg.Verb())
