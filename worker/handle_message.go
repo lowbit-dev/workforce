@@ -5,6 +5,8 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -134,6 +136,24 @@ func (w *Worker) runJob(ctx context.Context, proposal *contract.ProposeMessage, 
 
 	w.send(fmt.Sprintf("starting --job-id=%s --run-id=%s", dispatch.JobID, dispatch.RunID))
 
+	taskTmpDir := filepath.Join(w.cfg.TmpStorageDir, dispatch.JobID)
+	w.cfg.Logger.Debug("[Worker][runJob] Creating task tmp dir", "job_id", dispatch.JobID, "tmp_dir", taskTmpDir)
+	if err := os.MkdirAll(taskTmpDir, 0o755); err != nil {
+		w.cfg.Logger.Error("[Worker][runJob] Failed to create task tmp dir", "job_id", dispatch.JobID, "tmp_dir", taskTmpDir, "error", err)
+		w.send(fmt.Sprintf("result --job-id=%s --run-id=%s --type=error --reason='%s'", dispatch.JobID, dispatch.RunID, sanitize(err.Error())))
+		return
+	}
+	w.cfg.Logger.Debug("[Worker][runJob] Task tmp dir ready", "job_id", dispatch.JobID, "tmp_dir", taskTmpDir)
+
+	defer func() {
+		w.cfg.Logger.Debug("[Worker][runJob] Cleaning up task tmp dir", "job_id", dispatch.JobID, "tmp_dir", taskTmpDir)
+		if err := os.RemoveAll(taskTmpDir); err != nil {
+			w.cfg.Logger.Warn("[Worker][runJob] Failed to cleanup task tmp dir", "job_id", dispatch.JobID, "tmp_dir", taskTmpDir, "error", err)
+			return
+		}
+		w.cfg.Logger.Debug("[Worker][runJob] Task tmp dir cleaned up", "job_id", dispatch.JobID, "tmp_dir", taskTmpDir)
+	}()
+
 	t := taskExec{
 		JobID:       dispatch.JobID,
 		TaskName:    proposal.Task,
@@ -149,7 +169,8 @@ func (w *Worker) runJob(ctx context.Context, proposal *contract.ProposeMessage, 
 			MaxCPUCores:      dispatch.MaxCPUCores,
 		},
 		Proc: ProcConfig{
-			Env: append(SystemEnv(), EnvWithPrefix(w.cfg.InheritableENVPrefix)...),
+			RootDir: taskTmpDir,
+			Env:     append(SystemEnv(), EnvWithPrefix(w.cfg.InheritableENVPrefix)...),
 		},
 	}
 
