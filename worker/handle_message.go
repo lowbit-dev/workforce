@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"html"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -191,7 +192,7 @@ func (w *Worker) runJob(ctx context.Context, proposal *contract.ProposeMessage, 
 	w.sendWithPayload(logHeader, []byte(fmt.Sprintf(headertmpl, proposal.Task, dispatch.Phase, dispatch.Attempt, dispatch.JobID, dispatch.RunID, time.Now().Format(time.RFC3339), w.cfg.WorkerID)))
 
 	start := time.Now()
-	resultData, childJobsData, warnings, err := w.RunTask(ctx, t, logWriter)
+	resultData, childJobsData, _, err := w.RunTask(ctx, t, logWriter)
 	duration := time.Since(start)
 
 	logFooterHeader := fmt.Sprintf("log --job-id=%s --run-id=%s", dispatch.JobID, dispatch.RunID)
@@ -233,9 +234,9 @@ func (w *Worker) runJob(ctx context.Context, proposal *contract.ProposeMessage, 
 	w.sendWithPayload(logFooterHeader, []byte(fmt.Sprintf(footertmpl, "success", time.Now().Format(time.RFC3339), duration.String(), string(resultData))))
 
 	header := fmt.Sprintf("result --job-id=%s --run-id=%s --type=result --duration=%s", dispatch.JobID, dispatch.RunID, duration.String())
-	if warnings != "" {
-		header += fmt.Sprintf(" --warnings='%s'", sanitize(warnings))
-	}
+	// if warnings != "" {
+	// 	header += fmt.Sprintf(" --warnings='%s'", sanitize(warnings))
+	// }
 
 	slog.Debug("[Worker][runJob] Sending job complete message", "header", header, "payload", string(resultData))
 
@@ -244,7 +245,7 @@ func (w *Worker) runJob(ctx context.Context, proposal *contract.ProposeMessage, 
 
 // sanitize strips single quotes so values are safe to embed in a netargv single-quoted flag.
 func sanitize(s string) string {
-	return strings.Trim(strings.ReplaceAll(s, "'", ""), "\n\r\t")
+	return html.EscapeString(strings.Trim(strings.ReplaceAll(s, "'", ""), "\n\r\t"))
 }
 
 // =====================================================================

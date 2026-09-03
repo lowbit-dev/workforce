@@ -118,7 +118,7 @@ func (w *Worker) RunTask(ctx context.Context, t taskExec, logOutput io.Writer) (
 	cmd.Stdout = logOutput
 
 	var stderrBuf bytes.Buffer
-	cmd.Stderr = &stderrBuf
+	cmd.Stderr = io.MultiWriter(&stderrBuf, logOutput)
 
 	// TODO: Enable apply limits
 
