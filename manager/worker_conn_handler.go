@@ -428,15 +428,19 @@ func (s *WorkerConnServer) handleSubjobsEmitted(ctx context.Context, l *slog.Log
 			l.Error("[WorkerConnServer][handleSubjobsEmitted] Emitted child job targets unkown task", "task_name", req.Task, "parent_job_id", parent.ID, "error", err)
 
 			// TODO: Add a sential for this specific case
-			return errors.Join(err, s.m.JobStore().UpdateJob(ctx, parent.ID, func(j *contract.Job) {
+			reason := "child job targets unknown task: " + req.Task
+			updErr := s.m.JobStore().UpdateJob(ctx, parent.ID, func(j *contract.Job) {
 				failNow := time.Now()
 				failDuration := failNow.Sub(j.CreatedAt)
 				j.Status = contract.JobStatusFailed
-				j.FailureReason = "child job targets unknown task: " + req.Task
+				j.FailureReason = reason
 				j.UpdatedAt = failNow
 				j.CompletedAt = &failNow
 				j.Duration = &failDuration
-			}))
+			})
+			s.fireParentFailed(ctx, parent.ID, reason)
+
+			return errors.Join(err, updErr)
 		}
 
 		var artifactVersion string
@@ -447,15 +451,19 @@ func (s *WorkerConnServer) handleSubjobsEmitted(ctx context.Context, l *slog.Log
 				if err != nil || len(platforms) == 0 {
 					l.Error("[WorkerConnServer][handleSubjobsEmitted] Failed to find child artifact version not found", "task", taskDef.Name, "version", req.Version)
 
-					return errors.Join(err, s.m.JobStore().UpdateJob(ctx, parent.ID, func(j *contract.Job) {
+					reason := "child artifact " + req.Task + "@" + req.Version + " not found"
+					updErr := s.m.JobStore().UpdateJob(ctx, parent.ID, func(j *contract.Job) {
 						failNow := time.Now()
 						failDuration := failNow.Sub(j.CreatedAt)
 						j.Status = contract.JobStatusFailed
-						j.FailureReason = "child artifact " + req.Task + "@" + req.Version + " not found"
+						j.FailureReason = reason
 						j.UpdatedAt = failNow
 						j.CompletedAt = &failNow
 						j.Duration = &failDuration
-					}))
+					})
+					s.fireParentFailed(ctx, parent.ID, reason)
+
+					return errors.Join(err, updErr)
 				}
 
 				artifactVersion = req.Version
@@ -465,15 +473,19 @@ func (s *WorkerConnServer) handleSubjobsEmitted(ctx context.Context, l *slog.Log
 				if err != nil || len(platforms) == 0 {
 					l.Error("[WorkerConnServer][handleSubjobsEmitted] No released artifact for child task", "task", taskDef.Name)
 
-					return errors.Join(err, s.m.JobStore().UpdateJob(ctx, parent.ID, func(j *contract.Job) {
+					reason := "no released artifact for " + taskDef.Name
+					updErr := s.m.JobStore().UpdateJob(ctx, parent.ID, func(j *contract.Job) {
 						failNow := time.Now()
 						failDuration := failNow.Sub(j.CreatedAt)
 						j.Status = contract.JobStatusFailed
-						j.FailureReason = "no released artifact for " + taskDef.Name
+						j.FailureReason = reason
 						j.UpdatedAt = failNow
 						j.CompletedAt = &failNow
 						j.Duration = &failDuration
-					}))
+					})
+					s.fireParentFailed(ctx, parent.ID, reason)
+
+					return errors.Join(err, updErr)
 				}
 
 				artifactVersion = platforms[0].Version
@@ -497,15 +509,19 @@ func (s *WorkerConnServer) handleSubjobsEmitted(ctx context.Context, l *slog.Log
 		if err := s.m.JobStore().SaveJob(ctx, child); err != nil {
 			l.Error("[WorkerConnServer][handleSubjobsEmitted] Failed to save child job", "parent_job_id", parent.ID, "error", err)
 
-			return errors.Join(err, s.m.JobStore().UpdateJob(ctx, parent.ID, func(j *contract.Job) {
+			reason := fmt.Sprintf("internal error saving child jobs: %s", err.Error())
+			updErr := s.m.JobStore().UpdateJob(ctx, parent.ID, func(j *contract.Job) {
 				failNow := time.Now()
 				failDuration := failNow.Sub(j.CreatedAt)
 				j.Status = contract.JobStatusFailed
-				j.FailureReason = fmt.Sprintf("internal error saving child jobs: %s", err.Error())
+				j.FailureReason = reason
 				j.UpdatedAt = failNow
 				j.CompletedAt = &failNow
 				j.Duration = &failDuration
-			}))
+			})
+			s.fireParentFailed(ctx, parent.ID, reason)
+
+			return errors.Join(err, updErr)
 		}
 
 		children = append(children, child)
@@ -526,6 +542,15 @@ func (s *WorkerConnServer) handleSubjobsEmitted(ctx context.Context, l *slog.Log
 	s.m.EnqueueJobs(children)
 
 	return nil
+}
+
+func (s *WorkerConnServer) fireParentFailed(ctx context.Context, jobID, reason string) {
+	job, err := s.m.JobStore().GetJob(ctx, jobID)
+	if err != nil || job == nil {
+		return
+	}
+
+	s.m.WebhookDispatcher().FireJobFailed(ctx, job, reason)
 }
 
 func (s *WorkerConnServer) handleJobCompleted(ctx context.Context, l *slog.Logger, w *WorkerConn, job *contract.Job, msg *contract.ResultMessage) {
