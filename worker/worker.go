@@ -3,6 +3,7 @@ package worker
 import (
 	"context"
 	"crypto/rand"
+	"crypto/tls"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -316,10 +317,15 @@ func (w *Worker) ConnectAndWork(ctx context.Context) error {
 	}
 
 	worforceProtocolVersion := verreg.Version(0)
-	w.conn, err = cooper.Dial(req,
+	dialOpts := []cooper.DialOption{
 		cooper.WithProtocol(fmt.Sprintf("workforce/%d", worforceProtocolVersion)),
 		cooper.WithUpgradeOptions(contract.ProtoResponseValidator(workerKey)),
-	)
+	}
+
+	if req.URL.Scheme == "https" {
+		dialOpts = append(dialOpts, cooper.WithTLSConfig(&tls.Config{ServerName: req.URL.Hostname()}))
+	}
+	w.conn, err = cooper.Dial(req, dialOpts...)
 
 	if err != nil {
 		return fmt.Errorf("failed to connect to manager: %w", err)
