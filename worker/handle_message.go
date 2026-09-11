@@ -102,6 +102,7 @@ func (w *Worker) handleSystem(msg *contract.SystemMessage) {
 		w.state.Store(contract.WorkerStateDraining)
 		w.tasksMu.Lock()
 		remaining := len(w.tasks)
+		w.tasksMu.Unlock()
 
 		if remaining == 0 {
 			w.state.Store(contract.WorkerStateShuttingDown)
