@@ -4,7 +4,10 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"html"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -142,6 +145,24 @@ func (w *Worker) runJob(ctx context.Context, proposal *contract.ProposeMessage, 
 
 	w.send(fmt.Sprintf("starting --job-id=%s --run-id=%s", dispatch.JobID, dispatch.RunID))
 
+	taskTmpDir := filepath.Join(w.cfg.TmpStorageDir, dispatch.JobID)
+	w.cfg.Logger.Debug("[Worker][runJob] Creating task tmp dir", "job_id", dispatch.JobID, "tmp_dir", taskTmpDir)
+	if err := os.MkdirAll(taskTmpDir, 0o755); err != nil {
+		w.cfg.Logger.Error("[Worker][runJob] Failed to create task tmp dir", "job_id", dispatch.JobID, "tmp_dir", taskTmpDir, "error", err)
+		w.send(fmt.Sprintf("result --job-id=%s --run-id=%s --type=error --reason='%s'", dispatch.JobID, dispatch.RunID, sanitize(err.Error())))
+		return
+	}
+	w.cfg.Logger.Debug("[Worker][runJob] Task tmp dir ready", "job_id", dispatch.JobID, "tmp_dir", taskTmpDir)
+
+	defer func() {
+		w.cfg.Logger.Debug("[Worker][runJob] Cleaning up task tmp dir", "job_id", dispatch.JobID, "tmp_dir", taskTmpDir)
+		if err := os.RemoveAll(taskTmpDir); err != nil {
+			w.cfg.Logger.Warn("[Worker][runJob] Failed to cleanup task tmp dir", "job_id", dispatch.JobID, "tmp_dir", taskTmpDir, "error", err)
+			return
+		}
+		w.cfg.Logger.Debug("[Worker][runJob] Task tmp dir cleaned up", "job_id", dispatch.JobID, "tmp_dir", taskTmpDir)
+	}()
+
 	t := taskExec{
 		JobID:       dispatch.JobID,
 		TaskName:    proposal.Task,
@@ -157,7 +178,8 @@ func (w *Worker) runJob(ctx context.Context, proposal *contract.ProposeMessage, 
 			MaxCPUCores:      dispatch.MaxCPUCores,
 		},
 		Proc: ProcConfig{
-			Env: append(SystemEnv(), EnvWithPrefix(w.cfg.InheritableENVPrefix)...),
+			RootDir: taskTmpDir,
+			Env:     append(SystemEnv(), EnvWithPrefix(w.cfg.InheritableENVPrefix)...),
 		},
 	}
 
@@ -178,7 +200,7 @@ func (w *Worker) runJob(ctx context.Context, proposal *contract.ProposeMessage, 
 	w.sendWithPayload(logHeader, []byte(fmt.Sprintf(headertmpl, proposal.Task, dispatch.Phase, dispatch.Attempt, dispatch.JobID, dispatch.RunID, time.Now().Format(time.RFC3339), w.cfg.WorkerID)))
 
 	start := time.Now()
-	resultData, childJobsData, warnings, err := w.RunTask(ctx, t, logWriter)
+	resultData, childJobsData, _, err := w.RunTask(ctx, t, logWriter)
 	duration := time.Since(start)
 
 	logFooterHeader := fmt.Sprintf("log --job-id=%s --run-id=%s", dispatch.JobID, dispatch.RunID)
@@ -220,9 +242,9 @@ func (w *Worker) runJob(ctx context.Context, proposal *contract.ProposeMessage, 
 	w.sendWithPayload(logFooterHeader, []byte(fmt.Sprintf(footertmpl, "success", time.Now().Format(time.RFC3339), duration.String(), string(resultData))))
 
 	header := fmt.Sprintf("result --job-id=%s --run-id=%s --type=result --duration=%s", dispatch.JobID, dispatch.RunID, duration.String())
-	if warnings != "" {
-		header += fmt.Sprintf(" --warnings='%s'", sanitize(warnings))
-	}
+	// if warnings != "" {
+	// 	header += fmt.Sprintf(" --warnings='%s'", sanitize(warnings))
+	// }
 
 	slog.Debug("[Worker][runJob] Sending job complete message", "header", header, "payload", string(resultData))
 
@@ -231,7 +253,7 @@ func (w *Worker) runJob(ctx context.Context, proposal *contract.ProposeMessage, 
 
 // sanitize strips single quotes so values are safe to embed in a netargv single-quoted flag.
 func sanitize(s string) string {
-	return strings.Trim(strings.ReplaceAll(s, "'", ""), "\n\r\t")
+	return html.EscapeString(strings.Trim(strings.ReplaceAll(s, "'", ""), "\n\r\t"))
 }
 
 // =====================================================================

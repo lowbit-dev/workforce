@@ -8,7 +8,6 @@ import (
 	"os"
 	"os/exec"
 	"strings"
-	"syscall"
 	"time"
 )
 
@@ -28,9 +27,11 @@ type taskExec struct {
 
 // ProcConfig controls how the task process is launched.
 type ProcConfig struct {
+	// This feature is currently disabled untill its moved into a conditionally compiled module
 	// Credential sets the user and group identity for the process.
 	// Requires the Worker to have sufficient privileges to switch identity.
-	Credential *syscall.Credential
+	// Credential *syscall.Credential
+
 	// RootDir is the working directory for the task binary.
 	// If empty, a temporary directory is created and removed after the task exits.
 	RootDir string
@@ -104,18 +105,25 @@ func (w *Worker) RunTask(ctx context.Context, t taskExec, logOutput io.Writer) (
 		"WORKFORCE_TASK_TYPE="+t.TaskName,
 		"WORKFORCE_PARENT_JOB_ID="+t.ParentJobID,
 		fmt.Sprintf("WORKFORCE_ATTEMPT=%d", t.Attempt),
+
+		fmt.Sprintf("WORKFORCE_TMP_STORAGE_DIRECTORY=%s", w.cfg.TmpStorageDir),
+		fmt.Sprintf("WORKFORCE_TASK_STORAGE_DIRECTORY=%s", rootDir),
 	)
 
-	if t.Proc.Credential != nil {
-		cmd.SysProcAttr = &syscall.SysProcAttr{
-			Credential: t.Proc.Credential,
-		}
-	}
+	// TODO: Turn this into a conditionally compiled component
+	// TODO: since the syscall.SysProcAttr and syscall.Credentials
+	// TODO: Are not available on windows.
+	// TODO: Just disabled for now since we're not really using it a.t.m.
+	// if t.Proc.Credential != nil {
+	// 	cmd.SysProcAttr = &syscall.SysProcAttr{
+	// 		Credential: t.Proc.Credential,
+	// 	}
+	// }
 
 	cmd.Stdout = logOutput
 
 	var stderrBuf bytes.Buffer
-	cmd.Stderr = &stderrBuf
+	cmd.Stderr = io.MultiWriter(&stderrBuf, logOutput)
 
 	// TODO: Enable apply limits
 

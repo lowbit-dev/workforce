@@ -3,6 +3,7 @@ package worker
 import (
 	"context"
 	"crypto/rand"
+	"crypto/tls"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -62,6 +63,18 @@ type Config struct {
 
 	// CacheTTL evicts binaries not accessed within this window. Zero = no TTL eviction.
 	CacheTTL time.Duration
+
+	// TmpStorageDir is the path where the worker can manage tmp storage which should not be supervised by the kernel.
+	// This storage may be shared by tasks on the worker or be single task scoped.
+	// The worker will however enforce the TmpStorageMaxLifetime
+	TmpStorageDir string
+
+	// TmpStorageMaxLifetime defines the maximum lifetime of a file or directory stored in the TmpStorageDirectory. (Default 48 * Hour)
+	// Once a file or directort exeeds this lifetime the worker will unlink it.
+	TmpStorageMaxLifetime time.Duration
+
+	// TmpStorageCleanupInterval defines the interval in which the tmp storage locatioon will be cleaned up (Default: 3*Hour)
+	TmpStorageCleanupInterval time.Duration
 
 	// HeartbeatInterval governs how often the Worker sends TYPE_HEARTBEAT. Default: 10s.
 	HeartbeatInterval time.Duration
@@ -143,6 +156,14 @@ func (c *Config) applyDefaults() {
 
 	if c.InheritableENVPrefix == "" {
 		c.InheritableENVPrefix = "WORKFORCE_WORKER_TASK_"
+	}
+
+	if c.TmpStorageMaxLifetime == 0 {
+		c.TmpStorageMaxLifetime = 48 * time.Hour
+	}
+
+	if c.TmpStorageCleanupInterval == 0 {
+		c.TmpStorageCleanupInterval = 3 * time.Hour
 	}
 }
 
@@ -253,14 +274,16 @@ func (w *Worker) Run(ctx context.Context) error {
 
 func (w *Worker) ConnectAndWorkRoutine(ctx context.Context) error {
 	err := w.ConnectAndWork(ctx)
+	slog.Error("[ConnectAndWorkRoutine] Error while performing work", "error", err)
 
 	if w.state.Is(contract.WorkerStateShuttingDown) || ctx.Err() != nil || err == nil {
-		return rungroup.ErrShutdownAll
+		w.cfg.Logger.Info("[ConnectAndWorkRoutine] Received Shutdown signal. Shutting down...")
+		return fmt.Errorf("%w: %w", rungroup.ErrShutdownAll, err)
 	}
 
 	if errors.Is(err, retry.ErrRetryLimitExceeded) {
-		w.cfg.Logger.Info("[Worker] Max reconnect attempts exhausted. Shutting down...")
-		return fmt.Errorf("%w: %w", err, rungroup.ErrShutdownAll)
+		w.cfg.Logger.Info("[ConnectAndWorkRoutine] Max reconnect attempts exhausted. Shutting down...")
+		return fmt.Errorf("%w: %w", rungroup.ErrShutdownAll, err)
 	}
 
 	return err
@@ -294,14 +317,20 @@ func (w *Worker) ConnectAndWork(ctx context.Context) error {
 	}
 
 	worforceProtocolVersion := verreg.Version(0)
-	w.conn, err = cooper.Dial(req,
+	dialOpts := []cooper.DialOption{
 		cooper.WithProtocol(fmt.Sprintf("workforce/%d", worforceProtocolVersion)),
 		cooper.WithUpgradeOptions(contract.ProtoResponseValidator(workerKey)),
-	)
+	}
+
+	if req.URL.Scheme == "https" {
+		dialOpts = append(dialOpts, cooper.WithTLSConfig(&tls.Config{ServerName: req.URL.Hostname()}))
+	}
+	w.conn, err = cooper.Dial(req, dialOpts...)
 
 	if err != nil {
 		return fmt.Errorf("failed to connect to manager: %w", err)
 	}
+
 	defer w.conn.Close()
 	defer func() { w.conn = nil }()
 
@@ -314,7 +343,8 @@ func (w *Worker) ConnectAndWork(ctx context.Context) error {
 			if errors.Is(err, io.EOF) {
 				return nil
 			}
-			return err
+
+			return fmt.Errorf("failed to read message from stream: %w", err)
 		}
 
 		factory, err := w.messageVerreg.Resolve(worforceProtocolVersion, msg.Verb())
