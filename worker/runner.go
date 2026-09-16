@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"runtime"
 	"strings"
 	"time"
 )
@@ -98,7 +99,12 @@ func (w *Worker) RunTask(ctx context.Context, t taskExec, logOutput io.Writer) (
 	cmd := exec.CommandContext(runCtx, t.BinaryPath)
 	cmd.Stdin = bytes.NewReader(t.Payload)
 	cmd.Dir = rootDir
-	cmd.ExtraFiles = []*os.File{resultW, childJobsW} // FD3=result, FD4=child jobs
+
+	// Windows does not know about file descriptors
+	if runtime.GOOS != "windows" {
+		cmd.ExtraFiles = []*os.File{resultW, childJobsW} // FD3=result, FD4=child jobs
+	}
+
 	cmd.Env = append(t.Proc.Env,
 		"WORKFORCE_PHASE="+t.Phase,
 		"WORKFORCE_JOB_ID="+t.JobID,
