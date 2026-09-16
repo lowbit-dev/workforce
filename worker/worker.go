@@ -242,7 +242,7 @@ func (w *Worker) Run(ctx context.Context) error {
 	}
 
 	rg := rungroup.New(
-		// rungroup.WithShutdownBoundary(),
+		rungroup.WithShutdownBoundary(),
 		rungroup.WithShutdownTimeout(time.Minute*15),
 		rungroup.WithEventHandler(func(e rungroup.Event) {
 			slog.Info("[Worker][RunGroup] Event Received", "event", e)
