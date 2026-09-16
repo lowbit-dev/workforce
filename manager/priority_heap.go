@@ -104,6 +104,14 @@ func (pq *PriorityQueue[T]) Update(item *Item[T], newValue T) {
 	heap.Fix(pq, item.Index)
 }
 
+// Reheapify re-establishes heap ordering after item values were mutated in place
+// (e.g. priority aging). Safe for concurrent use, unlike calling heap.Init directly.
+func (pq *PriorityQueue[T]) Reheapify() {
+	pq.mu.Lock()
+	defer pq.mu.Unlock()
+	heap.Init(pq)
+}
+
 // Size safely returns the number of items in the queue.
 func (pq *PriorityQueue[T]) Size() int {
 	pq.mu.RLock()

@@ -249,6 +249,27 @@ func (h *WorkerPool) totalCapacity() int {
 	return total
 }
 
+// onlinePlatformKeys returns the set of platform keys ("os/arch") that have at
+// least one worker in Online state. The dispatcher uses this as a cheap
+// per-pass pre-filter: a job whose artifact platforms have no online worker at
+// all can be deferred without scanning eligible workers.
+func (h *WorkerPool) onlinePlatformKeys() map[string]struct{} {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
+	out := make(map[string]struct{}, len(h.platform))
+	for key, workers := range h.platform {
+		for _, w := range workers {
+			if w.IsInState(contract.WorkerStateOnline) {
+				out[key] = struct{}{}
+				break
+			}
+		}
+	}
+
+	return out
+}
+
 // allWorkers returns a snapshot of all connected workers for the GET /workers endpoint.
 func (h *WorkerPool) allWorkers() []*WorkerConn {
 	h.mu.RLock()

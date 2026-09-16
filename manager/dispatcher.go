@@ -1,7 +1,6 @@
 package manager
 
 import (
-	"container/heap"
 	"context"
 	"errors"
 	"fmt"
@@ -37,30 +36,181 @@ func (m *Manager) DispatcherRoutine(ctx context.Context) error {
 	}
 }
 
-// ProcessQueue pops and dispatches jobs until either the heap is empty or
-// no eligible worker can be found.
+// ProcessQueue runs a single dispatch pass over the queue. Jobs are popped in
+// priority order; jobs that cannot be dispatched right now (no eligible worker
+// for their platforms, missing artifact platform, transient errors) are deferred
+// and pushed back at the end of the pass, so one blocked job never starves the
+// jobs behind it (head-of-line blocking). Deferred jobs are retried on the next
+// wake-up signal (worker connect, capacity restore, new job, artifact publish,
+// or the periodic backstop).
 func (m *Manager) ProcessQueue(ctx context.Context) error {
 	m.lastDispatchRun.Store(uint64(time.Now().Unix()))
 
+	if m.queue.Size() == 0 {
+		return nil
+	}
+
+	m.Logger().Debug("[Dispatcher][ProcessQueue] Starting dispatch pass", "queued", m.queue.Size())
+
+	// Boost starved jobs once per pass rather than per pop.
+	m.applyStarvationAging()
+
+	// Snapshot of platforms with at least one online worker, plus per-pass caches
+	// for artifact platform keys and task existence (both stores are fs-backed).
+	onlinePlatforms := m.workers.onlinePlatformKeys()
+	platformCache := make(map[taskVersionKey][]string)
+	taskCache := make(map[string]struct{})
+
+	var deferred []*contract.Job
+	dispatched, failed := 0, 0
+	shortage := false
+
 	for job := m.PopNextJobFromQueue(); job != nil; job = m.PopNextJobFromQueue() {
+		platformKeys, d := m.jobPlatformKeysForDispatch(ctx, job, onlinePlatforms, platformCache, taskCache)
+		if d != nil {
+			if d.fail {
+				m.Logger().Warn("[Dispatcher][ProcessQueue] Failing job — permanent dispatch error",
+					"job_id", job.ID, "task", job.TaskName, "reason", d.reason)
+				m.failJobDirect(ctx, job, d.reason)
+				failed++
+				continue
+			}
 
-		// TODO: Make TryPropose return an error,
-		// TODO: switch on error sentinal if we need to re-queue it or mark it failed
+			m.Logger().Debug("[Dispatcher][ProcessQueue] Deferring job",
+				"job_id", job.ID, "task", job.TaskName, "reason", d.reason, "platforms", platformKeys)
+			deferred = append(deferred, job)
+			shortage = shortage || d.shortage
+			continue
+		}
 
-		if err := m.tryProposeJob(ctx, job); err != nil {
-			m.Logger().Warn("Failed to propose job", "job", job.ID, "task", job.TaskName, "error", err)
+		if err := m.tryProposeJob(ctx, job, platformKeys); err != nil {
+			if errors.Is(err, ErrUnknownTask) {
+				m.Logger().Warn("[Dispatcher][ProcessQueue] Failing job — unknown task",
+					"job_id", job.ID, "task", job.TaskName)
+				m.failJobDirect(ctx, job, fmt.Sprintf("unknown task: %s", job.TaskName))
+				failed++
+				continue
+			}
 
-			// TODO: based on the type of error, we should either requeue or mark as failed with a good reason
+			if errors.Is(err, ErrNoEledgibleWorkers) {
+				shortage = true
+			}
 
-			m.queue.PushItem(job)
-			m.checkResourceShortage(ctx)
+			m.Logger().Debug("[Dispatcher][ProcessQueue] Deferring job",
+				"job_id", job.ID, "task", job.TaskName, "reason", err.Error(), "platforms", platformKeys)
+			deferred = append(deferred, job)
+			continue
+		}
 
-			// TODO: Should this return or keep on trying to dispatch jobs?
-			return nil
+		dispatched++
+	}
+
+	// Re-queue deferred jobs so a later wake-up can retry them.
+	for _, job := range deferred {
+		m.queue.PushItem(job)
+	}
+
+	// Deferred jobs signal unmet demand — let the autoscaler hook decide.
+	if shortage {
+		m.checkResourceShortage(ctx)
+	}
+
+	summary := m.Logger().Debug
+	if dispatched > 0 || failed > 0 {
+		summary = m.Logger().Info
+	}
+	summary("[Dispatcher][ProcessQueue] Dispatch pass complete",
+		"dispatched", dispatched, "deferred", len(deferred), "failed", failed, "queued", m.queue.Size())
+
+	return nil
+}
+
+// taskVersionKey keys the per-pass artifact platform cache.
+type taskVersionKey struct {
+	task    string
+	version string
+}
+
+// jobDeferral describes why a job cannot dispatch in this pass.
+type jobDeferral struct {
+	reason   string
+	shortage bool // unmet worker demand — relevant for autoscaling
+	fail     bool // permanent error — fail the job instead of re-queuing
+}
+
+// jobPlatformKeysForDispatch resolves the artifact platform keys a job can run on
+// and decides whether the job is dispatchable in this pass. A nil deferral means
+// the job may proceed to tryProposeJob. Platform and task lookups are cached per
+// pass so a full queue scan stays cheap.
+func (m *Manager) jobPlatformKeysForDispatch(ctx context.Context, job *contract.Job, online map[string]struct{}, platformCache map[taskVersionKey][]string, taskCache map[string]struct{}) ([]string, *jobDeferral) {
+	// Unknown tasks can never dispatch — fail fast instead of re-queuing forever.
+	if _, ok := taskCache[job.TaskName]; !ok {
+		if _, err := m.cfg.TaskStore.GetTask(ctx, job.TaskName); err != nil {
+			return nil, &jobDeferral{reason: fmt.Sprintf("unknown task: %s", job.TaskName), fail: true}
+		}
+		taskCache[job.TaskName] = struct{}{}
+	}
+
+	if m.ArtifactRegistry() == nil {
+		return nil, nil // no platform constraints
+	}
+
+	key := taskVersionKey{task: job.TaskName, version: job.ArtifactVersion}
+	keys, ok := platformCache[key]
+	if !ok {
+		platforms, err := m.cfg.ArtifactsRegistry.ListPlatforms(ctx, job.TaskName, job.ArtifactVersion)
+		if err != nil {
+			// Transient registry error — retry next pass.
+			return nil, &jobDeferral{reason: fmt.Sprintf("list platforms: %s", err)}
+		}
+
+		keys = make([]string, 0, len(platforms))
+		for _, p := range platforms {
+			keys = append(keys, platformKey(p.OS, p.Arch))
+		}
+		platformCache[key] = keys
+	}
+
+	if len(keys) == 0 {
+		return nil, &jobDeferral{reason: ErrNoArtifactPlatform.Error()}
+	}
+
+	// Cheap pre-filter: no online worker for any of the job's platforms.
+	for _, k := range keys {
+		if _, ok := online[k]; ok {
+			return keys, nil
 		}
 	}
 
-	return nil
+	return keys, &jobDeferral{reason: "no online workers for artifact platforms", shortage: true}
+}
+
+// applyStarvationAging boosts jobs pending longer than StarvationTimeout to
+// max+1 priority. Called once per dispatch pass.
+func (m *Manager) applyStarvationAging() {
+	if m.cfg.StarvationTimeout <= 0 {
+		return
+	}
+
+	maxP := 0
+	for job := range m.queue.Values() {
+		if job.Priority > maxP {
+			maxP = job.Priority
+		}
+	}
+
+	now := time.Now()
+	dirty := false
+	for job := range m.queue.Values() {
+		if now.Sub(job.CreatedAt) > m.cfg.StarvationTimeout && job.Priority <= maxP {
+			job.Priority = maxP + 1
+			dirty = true
+		}
+	}
+
+	if dirty {
+		m.queue.Reheapify()
+	}
 }
 
 // EnqueueJob adds a job to the in-memory dispatch heap and signals the loop.
@@ -82,40 +232,16 @@ func (m *Manager) EnqueueJobs(jobs []*contract.Job) {
 	m.NotifyDispatcher()
 }
 
-// popNext pops the highest-effective-priority job, applying starvation aging when configured.
+// PopNextJobFromQueue pops the highest-effective-priority job.
 // Skips jobs that were cancelled while sitting in the heap.
 func (m *Manager) PopNextJobFromQueue() *contract.Job {
 	if m.queue.Size() < 1 {
 		return nil
 	}
 
-	// Apply priority aging: boost starved jobs to max+1.
-	if m.cfg.StarvationTimeout > 0 {
-		maxP := 0
-		for job := range m.queue.Values() {
-			if job.Priority > maxP {
-				maxP = job.Priority
-			}
-		}
-
-		now := time.Now()
-		heapDirty := false
-
-		for job := range m.queue.Values() {
-			if now.Sub(job.CreatedAt) > m.cfg.StarvationTimeout && job.Priority <= maxP {
-				job.Priority = maxP + 1
-				heapDirty = true
-			}
-		}
-
-		if heapDirty {
-			heap.Init(m.queue)
-		}
-	}
-
 	job, ok := m.queue.PopItem()
 	if !ok {
-		// Queue was empty, noting to pop
+		// Queue was empty, nothing to pop
 		return nil
 	}
 
@@ -128,9 +254,11 @@ func (m *Manager) PopNextJobFromQueue() *contract.Job {
 }
 
 // tryPropose selects a worker and sends TYPE_PROPOSE_JOB for the given job.
-// Returns true if the proposal was sent successfully (job is now Proposing).
-// On NACK the packet reader calls requeueJob; on no eligible workers returns false.
-func (m *Manager) tryProposeJob(ctx context.Context, job *contract.Job) error {
+// platformKeys are the artifact platforms the job can run on, resolved (and
+// cached) by the caller for this dispatch pass; empty means no platform
+// constraint when no artifact registry is configured.
+// On NACK the packet reader re-queues the job via EnqueueJob.
+func (m *Manager) tryProposeJob(ctx context.Context, job *contract.Job, platformKeys []string) error {
 	taskDef, err := m.cfg.TaskStore.GetTask(ctx, job.TaskName)
 	if err != nil {
 		m.Logger().Error("unknown task — discarding", "job_id", job.ID, "task_name", job.TaskName)
@@ -138,25 +266,11 @@ func (m *Manager) tryProposeJob(ctx context.Context, job *contract.Job) error {
 		return fmt.Errorf("%w: taks(%s)", ErrUnknownTask, job.TaskName)
 	}
 
-	platformKeys := []string{}
-
-	// Determine eligible workers from the artifact's available platforms.
-	if m.ArtifactRegistry() != nil {
-		platforms, err := m.cfg.ArtifactsRegistry.ListPlatforms(ctx, job.TaskName, job.ArtifactVersion)
-		if err != nil {
-			m.Logger().Error("dispatcher: list platforms failed — re-queuing", "job_id", job.ID, "task", job.TaskName, "error", err)
-
-			return err
-		}
-
-		if len(platforms) == 0 {
-			m.Logger().Warn("dispatcher: no artifact platforms for task/version", "job_id", job.ID, "task", job.TaskName, "version", job.ArtifactVersion)
-			return ErrNoArtifactPlatform
-		}
-
-		for _, p := range platforms {
-			platformKeys = append(platformKeys, platformKey(p.OS, p.Arch))
-		}
+	// With a registry configured, an empty platform set means the artifact has
+	// no builds for the requested version — the job can never dispatch.
+	if m.ArtifactRegistry() != nil && len(platformKeys) == 0 {
+		m.Logger().Warn("dispatcher: no artifact platforms for task/version", "job_id", job.ID, "task", job.TaskName, "version", job.ArtifactVersion)
+		return ErrNoArtifactPlatform
 	}
 
 	workers := m.workers.eligibleWorkers(platformKeys, job.Cost, job.ID)
@@ -259,6 +373,10 @@ func (m *Manager) tryProposeJob(ctx context.Context, job *contract.Job) error {
 
 		return err
 	}
+
+	m.Logger().Debug("[Dispatcher][tryProposeJob] Job proposal sent",
+		"job_id", job.ID, "task", job.TaskName, "worker_id", selected.workerID,
+		"worker_platform", platformKey(selected.os, selected.arch), "cost", job.Cost)
 
 	// Fire job.proposing webhook.
 	if m.WebhookDispatcher() != nil {

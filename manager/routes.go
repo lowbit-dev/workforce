@@ -872,6 +872,11 @@ func (m *Manager) publishArtifact(w http.ResponseWriter, r *http.Request, artifa
 		problemjson.InternalServerError(problemjson.Detail("publish failed")).ServeHTTP(w, r)
 		return
 	}
+
+	// A newly published artifact may unblock deferred jobs (e.g. the first build
+	// for a platform), so wake the dispatcher instead of waiting for the backstop.
+	m.NotifyDispatcher()
+
 	w.WriteHeader(http.StatusCreated)
 }
 
