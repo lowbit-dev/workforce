@@ -341,6 +341,7 @@ func (w *Worker) ConnectAndWork(ctx context.Context) error {
 	if req.URL.Scheme == "https" {
 		dialOpts = append(dialOpts, cooper.WithTLSConfig(&tls.Config{ServerName: req.URL.Hostname()}))
 	}
+
 	w.conn, err = cooper.Dial(req, dialOpts...)
 
 	if err != nil {
@@ -357,6 +358,7 @@ func (w *Worker) ConnectAndWork(ctx context.Context) error {
 	for msg, err := range reader.Itterate(ctx) {
 		if err != nil {
 			if errors.Is(err, io.EOF) {
+				slog.Warn("[ConnectAndWork] Reached EOF of stream")
 				return nil
 			}
 
