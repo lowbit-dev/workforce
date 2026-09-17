@@ -242,7 +242,7 @@ func (w *Worker) Run(ctx context.Context) error {
 	}
 
 	rg := rungroup.New(
-		rungroup.WithShutdownBoundary(),
+		// rungroup.WithShutdownBoundary(),
 		rungroup.WithShutdownTimeout(time.Minute*15),
 		rungroup.WithEventHandler(func(e rungroup.Event) {
 			slog.Info("[Worker][RunGroup] Event Received", "event", e)
@@ -276,17 +276,33 @@ func (w *Worker) ConnectAndWorkRoutine(ctx context.Context) error {
 	err := w.ConnectAndWork(ctx)
 	slog.Error("[ConnectAndWorkRoutine] Error while performing work", "error", err)
 
-	if w.state.Is(contract.WorkerStateShuttingDown) || ctx.Err() != nil || err == nil {
-		w.cfg.Logger.Info("[ConnectAndWorkRoutine] Received Shutdown signal. Shutting down...")
+	if err != nil {
+		if w.state.Is(contract.WorkerStateShuttingDown) {
+			w.cfg.Logger.Info("[ConnectAndWorkRoutine] Error while performing work and worker in state 'ShuttingDown'. Shutting down...", "error", err)
+			return fmt.Errorf("%w: %w", rungroup.ErrShutdownAll, err)
+		}
+
+		if errors.Is(err, retry.ErrRetryLimitExceeded) {
+			w.cfg.Logger.Info("[ConnectAndWorkRoutine] Max reconnect attempts exhausted. Shutting down...")
+			return fmt.Errorf("%w: %w", rungroup.ErrShutdownAll, err)
+		}
+
+		w.cfg.Logger.Info("[ConnectAndWorkRoutine] Error while performing work", "error", err)
+		return err
+	}
+
+	if w.state.Is(contract.WorkerStateShuttingDown) {
+		w.cfg.Logger.Info("[ConnectAndWorkRoutine] Received Shutdown signal. Worker in state 'ShuttingDown'. Shutting down...")
+		return rungroup.ErrShutdownAll
+	}
+
+	if ctx.Err() != nil {
+		w.cfg.Logger.Info("[ConnectAndWorkRoutine] Context has expired. Shutting down...")
 		return fmt.Errorf("%w: %w", rungroup.ErrShutdownAll, err)
 	}
 
-	if errors.Is(err, retry.ErrRetryLimitExceeded) {
-		w.cfg.Logger.Info("[ConnectAndWorkRoutine] Max reconnect attempts exhausted. Shutting down...")
-		return fmt.Errorf("%w: %w", rungroup.ErrShutdownAll, err)
-	}
-
-	return err
+	slog.Error("[ConnectAndWorkRoutine] Reached unreachable. Non exhaustive error handling in ConnectAndWorkRoutine", "error", err, "ctx.Err", ctx.Err().Error(), "workerState", w.state.Load().String())
+	panic("UNREACHABLE REACHED")
 }
 
 // run attempts one connection. On an unexpected disconnect it backs off and calls itself
