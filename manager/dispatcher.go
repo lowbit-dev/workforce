@@ -316,7 +316,7 @@ func (m *Manager) tryProposeJob(ctx context.Context, job *contract.Job, platform
 		}
 	}
 
-	if err := selected.Send(contract.FormulateProposeV0Message(job, &artInfo)); err != nil {
+	if err := selected.Send(contract.FormulateProposeV0Message(job, taskDef, &artInfo)); err != nil {
 		// TODO: handle the error
 		m.Logger().Error("Failed to send job proposal to worker", "job", job.ID, "worker", selected.workerID, "error", err)
 

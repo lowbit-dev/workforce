@@ -153,13 +153,17 @@ func proposeV0Factory(m netargv.Message) (Message, error) {
 	}, nil
 }
 
-func FormulateProposeV0Message(job *Job, artifactInfo *ArtifactInfo) string {
+func FormulateProposeV0Message(job *Job, task *Task, artifactInfo *ArtifactInfo) string {
 	msg := fmt.Sprintf("propose --job-id=%s --task=%s --cost=%d --artifact-hash=%s --artifact-url=%s",
 		job.ID, job.TaskName, job.Cost, artifactInfo.Hash, artifactInfo.URL,
 	)
 
 	for _, dep := range artifactInfo.Dependencies {
 		msg += " --dep=" + dep
+	}
+
+	if task.NoResult {
+		msg += " --no-result"
 	}
 
 	return msg
