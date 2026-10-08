@@ -258,7 +258,7 @@ func (m *MemStore) AppendRunLog(_ context.Context, runID string, data []byte) er
 	}
 	m.mu.RUnlock()
 
-	m.logMu.Unlock()
+	defer m.logMu.Unlock()
 
 	chunk := make([]byte, len(data))
 	copy(chunk, data)
@@ -361,15 +361,16 @@ func (m *MemStore) SubscribeJobLogs(ctx context.Context, jobID string) (<-chan [
 	go func() {
 		<-ctx.Done()
 		m.logMu.Lock()
+		defer m.logMu.Unlock()
+
 		subs := m.jobSubscribers[jobID]
 		for i, sub := range subs {
 			if sub == ch {
 				m.jobSubscribers[jobID] = append(subs[:i], subs[i+1:]...)
-				break
+				close(ch)
+				return
 			}
 		}
-		m.logMu.Unlock()
-		close(ch)
 	}()
 
 	return ch, nil

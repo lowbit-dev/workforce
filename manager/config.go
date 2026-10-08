@@ -247,7 +247,7 @@ func (c *Config) applyDefaults() {
 	}
 
 	if c.DefaultDoNotRetryExitCodeRange.To == 0 {
-		c.DefaultDoNotRetryExitCodeRange.From = 254
+		c.DefaultDoNotRetryExitCodeRange.To = 254
 	}
 }
 

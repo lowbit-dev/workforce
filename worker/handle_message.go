@@ -110,7 +110,7 @@ func (w *Worker) handleSystem(msg *contract.SystemMessage) {
 		if remaining == 0 {
 			w.state.Store(contract.WorkerStateShuttingDown)
 			w.cfg.Logger.Info("[Worker][handleSystem] Drain completed (no active tasks. Closing connection...")
-			w.conn.Close()
+			w.closeConn()
 		}
 	case "shutdown":
 		if w.state.Transition(contract.WorkerStateOnline, contract.WorkerStateShuttingDown) || w.state.Transition(contract.WorkerStateDraining, contract.WorkerStateShuttingDown) {
@@ -296,6 +296,6 @@ func (w *Worker) releaseTask(jobID string) {
 		w.state.Store(contract.WorkerStateShuttingDown)
 
 		w.cfg.Logger.Info("[Worker][releaseTask] Drain completed. Closing connection...")
-		w.conn.Close()
+		w.closeConn()
 	}
 }

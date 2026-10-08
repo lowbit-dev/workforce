@@ -374,7 +374,7 @@ func (fs *FSStore) AppendRunLog(_ context.Context, runID string, data []byte) er
 	}
 	fs.mu.RUnlock()
 
-	fs.logMu.Unlock()
+	defer fs.logMu.Unlock()
 
 	if writeErr != nil {
 		return fmt.Errorf("fsstore: write run log for %s: %w", runID, writeErr)
@@ -484,15 +484,16 @@ func (fs *FSStore) SubscribeJobLogs(ctx context.Context, jobID string) (<-chan [
 	go func() {
 		<-ctx.Done()
 		fs.logMu.Lock()
+		defer fs.logMu.Unlock()
+
 		subs := fs.jobSubscribers[jobID]
 		for i, sub := range subs {
 			if sub == ch {
 				fs.jobSubscribers[jobID] = append(subs[:i], subs[i+1:]...)
-				break
+				close(ch)
+				return
 			}
 		}
-		fs.logMu.Unlock()
-		close(ch)
 	}()
 
 	return ch, nil
