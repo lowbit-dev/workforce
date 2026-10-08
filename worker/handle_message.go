@@ -1,7 +1,6 @@
 package worker
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"html"
@@ -242,10 +241,6 @@ func (w *Worker) runJob(ctx context.Context, proposal *contract.ProposeMessage, 
 	w.sendWithPayload(logFooterHeader, []byte(fmt.Sprintf(footertmpl, "success", time.Now().Format(time.RFC3339), duration.String(), string(resultData))))
 
 	header := fmt.Sprintf("result --job-id=%s --run-id=%s --type=result --duration=%s", dispatch.JobID, dispatch.RunID, duration.String())
-	// if warnings != "" {
-	// 	header += fmt.Sprintf(" --warnings='%s'", sanitize(warnings))
-	// }
-
 	slog.Debug("[Worker][runJob] Sending job complete message", "header", header, "payload", string(resultData))
 
 	w.sendWithPayload(header, resultData)
@@ -270,17 +265,21 @@ type logLineWriter struct {
 }
 
 func (l *logLineWriter) Write(p []byte) (int, error) {
-	l.buf = append(l.buf, p...)
-	for {
-		idx := bytes.IndexByte(l.buf, '\n')
-		if idx < 0 {
-			break
-		}
-		line := l.buf[:idx]
-		l.buf = l.buf[idx+1:]
-		l.w.sendWithPayload(fmt.Sprintf("log --job-id=%s --run-id=%s", l.jobID, l.runID), line)
-	}
+	l.w.sendWithPayload(fmt.Sprintf("log --job-id=%s --run-id=%s", l.jobID, l.runID), p)
+
 	return len(p), nil
+
+	// l.buf = append(l.buf, p...)
+	// for {
+	// 	idx := bytes.IndexByte(l.buf, '\n')
+	// 	if idx < 0 {
+	// 		break
+	// 	}
+	// 	line := l.buf[:idx]
+	// 	l.buf = l.buf[idx+1:]
+	// 	l.w.sendWithPayload(fmt.Sprintf("log --job-id=%s --run-id=%s", l.jobID, l.runID), line)
+	// }
+	// return len(p), nil
 }
 
 func (w *Worker) releaseTask(jobID string) {
