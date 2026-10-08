@@ -85,16 +85,20 @@ func (h *WorkerPool) register(w *WorkerConn) {
 func (h *WorkerPool) unregister(w *WorkerConn) {
 	h.mu.Lock()
 	ids := w.inFlightIDs()
-	h.removeConnLocked(w)
+	removed := h.removeConnLocked(w)
 	h.mu.Unlock()
 
-	if len(ids) > 0 && h.onJobsRequeued != nil {
+	if removed && len(ids) > 0 && h.onJobsRequeued != nil {
 		h.onJobsRequeued(ids)
 	}
 }
 
 // removeConnLocked removes w from the workers map and platform index. Must hold h.mu write lock.
-func (h *WorkerPool) removeConnLocked(w *WorkerConn) {
+func (h *WorkerPool) removeConnLocked(w *WorkerConn) bool {
+	if current, ok := h.workers[w.workerID]; !ok || current != w {
+		return false
+	}
+
 	delete(h.workers, w.workerID)
 	key := platformKey(w.os, w.arch)
 	list := h.platform[key]
@@ -105,6 +109,8 @@ func (h *WorkerPool) removeConnLocked(w *WorkerConn) {
 			break
 		}
 	}
+
+	return true
 }
 
 func (p *WorkerPool) GetWorker(id string) (*WorkerConn, bool) {
