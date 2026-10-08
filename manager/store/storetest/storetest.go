@@ -14,8 +14,10 @@ package storetest
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -362,6 +364,101 @@ func RunLogStoreTests(t *testing.T, factory func() logRunStore) {
 			}
 		case <-ctx.Done():
 			t.Fatal("timeout waiting for log chunk")
+		}
+	})
+
+	t.Run("SubscribeJobLogs_ClosedThenCancelled", func(t *testing.T) {
+		t.Helper()
+		s := factory()
+
+		ctx, cancel := context.WithCancel(context.Background())
+		ch, err := s.SubscribeJobLogs(ctx, "job-close-1")
+		if err != nil {
+			t.Fatalf("SubscribeJobLogs: %v", err)
+		}
+
+		if err := s.CloseJobLogSubscribers("job-close-1"); err != nil {
+			t.Fatalf("CloseJobLogSubscribers: %v", err)
+		}
+		if _, ok := <-ch; ok {
+			t.Fatal("expected channel to be closed after CloseJobLogSubscribers")
+		}
+
+		cancel()
+		time.Sleep(100 * time.Millisecond)
+	})
+
+	t.Run("SubscribeJobLogs_CancelClosesChannel", func(t *testing.T) {
+		t.Helper()
+		s := factory()
+
+		ctx, cancel := context.WithCancel(context.Background())
+		ch, err := s.SubscribeJobLogs(ctx, "job-cancel-1")
+		if err != nil {
+			t.Fatalf("SubscribeJobLogs: %v", err)
+		}
+
+		cancel()
+
+		select {
+		case _, ok := <-ch:
+			if ok {
+				t.Fatal("expected channel to be closed after ctx cancel")
+			}
+		case <-time.After(time.Second):
+			t.Fatal("channel not closed after ctx cancel")
+		}
+	})
+
+	// Regression: log lines racing run/job completion panicked with
+	// "send on closed channel".
+	t.Run("AppendRunLog_ConcurrentWithClose", func(t *testing.T) {
+		t.Helper()
+		s := factory()
+		ctx := context.Background()
+
+		for i := 0; i < 100; i++ {
+			runID := fmt.Sprintf("run-race-%d", i)
+			_ = s.CreateRun(ctx, &contract.JobRun{ID: runID, JobID: "job-race", Status: contract.RunStatusRunning})
+
+			jobCtx, cancelJob := context.WithCancel(ctx)
+			jobCh, err := s.SubscribeJobLogs(jobCtx, "job-race")
+			if err != nil {
+				t.Fatalf("SubscribeJobLogs: %v", err)
+			}
+			runCh, err := s.SubscribeRunLogs(ctx, runID)
+			if err != nil {
+				t.Fatalf("SubscribeRunLogs: %v", err)
+			}
+
+			var consumers sync.WaitGroup
+			for _, ch := range []<-chan []byte{jobCh, runCh} {
+				consumers.Add(1)
+				go func(ch <-chan []byte) {
+					defer consumers.Done()
+					for range ch {
+					}
+				}(ch)
+			}
+
+			var wg sync.WaitGroup
+			for w := 0; w < 8; w++ {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					for n := 0; n < 20; n++ {
+						_ = s.AppendRunLog(ctx, runID, []byte("line"))
+					}
+				}()
+			}
+
+			wg.Add(3)
+			go func() { defer wg.Done(); _ = s.CloseJobLogSubscribers("job-race") }()
+			go func() { defer wg.Done(); _ = s.CloseRunLogSubscribers(runID) }()
+			go func() { defer wg.Done(); cancelJob() }()
+			wg.Wait()
+
+			consumers.Wait()
 		}
 	})
 }
