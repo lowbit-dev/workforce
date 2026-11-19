@@ -28,6 +28,7 @@ import (
 
 var (
 	ErrHandshakeFailed = errors.New("handshake failed")
+	ErrNotConnected    = errors.New("not connected to manager")
 )
 
 // ResourceLimits defines system-level safety margins for the Worker.
@@ -185,9 +186,10 @@ type Worker struct {
 	depCache   map[string]struct{}
 
 	// Connection-scoped — reset at the start of each connectAndServe.
-	state contract.AtomicWorkerState
-	conn  net.Conn
-	done  chan struct{} // closed on planned exit (drain/shutdown)
+	state  contract.AtomicWorkerState
+	connMu sync.RWMutex
+	conn   net.Conn      // protected by connMu; nil while disconnected
+	done   chan struct{} // closed on planned exit (drain/shutdown)
 
 	tasksMu                   sync.Mutex
 	tasks                     map[string]*activeTask
@@ -298,10 +300,10 @@ func (w *Worker) ConnectAndWorkRoutine(ctx context.Context) error {
 
 	if ctx.Err() != nil {
 		w.cfg.Logger.Info("[ConnectAndWorkRoutine] Context has expired. Shutting down...")
-		return fmt.Errorf("%w: %w", rungroup.ErrShutdownAll, err)
+		return fmt.Errorf("%w: %w", rungroup.ErrShutdownAll, ctx.Err())
 	}
 
-	slog.Error("[ConnectAndWorkRoutine] Reached unreachable. Non exhaustive error handling in ConnectAndWorkRoutine", "error", err, "ctx.Err", ctx.Err().Error(), "workerState", w.state.Load().String())
+	slog.Error("[ConnectAndWorkRoutine] Reached unreachable. Non exhaustive error handling in ConnectAndWorkRoutine", "error", err, "ctx.Err", ctx.Err(), "workerState", w.state.Load().String())
 	panic("UNREACHABLE REACHED")
 }
 
@@ -342,19 +344,22 @@ func (w *Worker) ConnectAndWork(ctx context.Context) error {
 		dialOpts = append(dialOpts, cooper.WithTLSConfig(&tls.Config{ServerName: req.URL.Hostname()}))
 	}
 
-	w.conn, err = cooper.Dial(req, dialOpts...)
+	conn, err := cooper.Dial(req, dialOpts...)
 
 	if err != nil {
 		return fmt.Errorf("failed to connect to manager: %w", err)
 	}
 
-	defer w.conn.Close()
-	defer func() { w.conn = nil }()
-
+	// Reset the ack before publishing the conn, otherwise HeartbeatRoutine can observe
+	// the new conn together with a stale ack and time out immediately.
 	w.lastHeartbeatAck.Store(time.Now().UnixNano())
+	w.setConn(conn)
+	defer conn.Close()
+	defer w.setConn(nil)
+
 	w.state.Store(contract.WorkerStateOnline)
 
-	reader := netargv.NewReader(w.conn)
+	reader := netargv.NewReader(conn)
 	for msg, err := range reader.Itterate(ctx) {
 		if err != nil {
 			if errors.Is(err, io.EOF) {
@@ -384,15 +389,17 @@ func (w *Worker) ConnectAndWork(ctx context.Context) error {
 }
 
 func (w *Worker) HeartbeatRoutine(ctx context.Context) error {
-	if w.conn == nil {
+	if w.currentConn() == nil {
 		slog.Debug("[HeartbeatRoutine] No connection established yet. Skipping round...")
 		return nil
 	}
 
-	delta := time.Now().Unix() - w.lastHeartbeatAck.Load()
-	if delta > int64(w.cfg.HeartbeatTimeout.Seconds()) {
+	delta := time.Since(time.Unix(0, w.lastHeartbeatAck.Load()))
+	if delta > w.cfg.HeartbeatTimeout {
 		w.cfg.Logger.Warn("[Worker][HeartbeatRoutine] Heartbeat timed-out, did not recieve heartbeat from manager within timout window. Closing connection...", "worker_id", w.cfg.WorkerID, "delta", delta)
-		_ = w.conn.Close()
+		if err := w.closeConn(); err != nil {
+			w.cfg.Logger.Warn("[Worker][HeartbeatRoutine] Failed to close connection after heartbeat timeout", "error", err)
+		}
 
 		return rungroup.ErrShutdownAll
 	}
@@ -415,7 +422,9 @@ func (w *Worker) HeartbeatRoutine(ctx context.Context) error {
 
 		if totalConsecutiveFaulures >= 3 {
 			w.cfg.Logger.Warn("[Worker][HeartbeatRoutine] Failed to send heartbeat 3 times in a row. Colsing Connection...", "error", err)
-			_ = w.conn.Close()
+			if err := w.closeConn(); err != nil {
+				w.cfg.Logger.Warn("[Worker][HeartbeatRoutine] Failed to close connection after heartbeat send failures", "error", err)
+			}
 		}
 
 		return err
@@ -462,11 +471,39 @@ func (w *Worker) checkDeps(deps []string) []string {
 
 // ---- helpers ----
 
+// setConn replaces the active connection. Pass nil to mark the worker as disconnected.
+func (w *Worker) setConn(conn net.Conn) {
+	w.connMu.Lock()
+	defer w.connMu.Unlock()
+	w.conn = conn
+}
+
+// currentConn returns the active connection, or nil when disconnected.
+func (w *Worker) currentConn() net.Conn {
+	w.connMu.RLock()
+	defer w.connMu.RUnlock()
+	return w.conn
+}
+
+// closeConn closes the active connection. Returns ErrNotConnected when there is none.
+func (w *Worker) closeConn() error {
+	conn := w.currentConn()
+	if conn == nil {
+		return ErrNotConnected
+	}
+	return conn.Close()
+}
+
 // send writes a pre-formatted netargv line to the connection.
 func (w *Worker) send(line string) error {
+	conn := w.currentConn()
+	if conn == nil {
+		return ErrNotConnected
+	}
+
 	w.sendMu.Lock()
 	defer w.sendMu.Unlock()
-	_, err := fmt.Fprintln(w.conn, line)
+	_, err := fmt.Fprintln(conn, line)
 	return err
 }
 
@@ -474,12 +511,17 @@ func (w *Worker) send(line string) error {
 // header must be a fully formed netargv header without the "-- <n>" suffix.
 // The payload length and bytes are appended atomically under sendMu.
 func (w *Worker) sendWithPayload(header string, payload []byte) error {
+	conn := w.currentConn()
+	if conn == nil {
+		return ErrNotConnected
+	}
+
 	w.sendMu.Lock()
 	defer w.sendMu.Unlock()
-	if _, err := fmt.Fprintf(w.conn, "%s -- %d\n", header, len(payload)); err != nil {
+	if _, err := fmt.Fprintf(conn, "%s -- %d\n", header, len(payload)); err != nil {
 		return err
 	}
-	_, err := w.conn.Write(payload)
+	_, err := conn.Write(payload)
 	return err
 }
 

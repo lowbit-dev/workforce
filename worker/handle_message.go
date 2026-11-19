@@ -38,25 +38,33 @@ func (w *Worker) handleMessage(ctx context.Context, msg contract.Message) {
 // the netargv framing valid.
 func (w *Worker) sendError(code, message string) {
 	safe := strings.ReplaceAll(message, "'", "")
-	w.send(fmt.Sprintf("error --code=%s --message='%s'", code, safe))
+	if err := w.send(fmt.Sprintf("error --code=%s --message='%s'", code, safe)); err != nil {
+		w.cfg.Logger.Warn("[Worker][sendError] Failed to send error message", "code", code, "error", err)
+	}
 }
 
 func (w *Worker) handlePropose(msg *contract.ProposeMessage) {
 	if !w.state.Is(contract.WorkerStateOnline) {
-		w.send(fmt.Sprintf("reject --job-id=%s --reason=draining", msg.JobID))
+		if err := w.send(fmt.Sprintf("reject --job-id=%s --reason=draining", msg.JobID)); err != nil {
+			w.cfg.Logger.Warn("[Worker][handlePropose] Failed to send reject", "job_id", msg.JobID, "reason", "draining", "error", err)
+		}
 		return
 	}
 
 	if w.cfg.ResourceLimits.MaxCPUPercent > 0 || w.cfg.ResourceLimits.MaxMemPercent > 0 {
 		snap := w.metricsSampler.snapshot()
 		if snap.IsOverLimit(w.cfg.ResourceLimits.MaxCPUPercent, w.cfg.ResourceLimits.MaxMemPercent) {
-			w.send(fmt.Sprintf("reject --job-id=%s --reason=pressure", msg.JobID))
+			if err := w.send(fmt.Sprintf("reject --job-id=%s --reason=pressure", msg.JobID)); err != nil {
+				w.cfg.Logger.Warn("[Worker][handlePropose] Failed to send reject", "job_id", msg.JobID, "reason", "pressure", "error", err)
+			}
 			return
 		}
 	}
 
 	if missing := w.checkDeps(msg.ArtifactDeps); len(missing) > 0 {
-		w.send(fmt.Sprintf("reject --job-id=%s --reason=missing_deps --detail='%s'", msg.JobID, strings.Join(missing, ",")))
+		if err := w.send(fmt.Sprintf("reject --job-id=%s --reason=missing_deps --detail='%s'", msg.JobID, strings.Join(missing, ","))); err != nil {
+			w.cfg.Logger.Warn("[Worker][handlePropose] Failed to send reject", "job_id", msg.JobID, "reason", "missing_deps", "error", err)
+		}
 		return
 	}
 
@@ -69,11 +77,15 @@ func (w *Worker) handlePropose(msg *contract.ProposeMessage) {
 	w.tasksMu.Unlock()
 
 	if !canAccept {
-		w.send(fmt.Sprintf("reject --job-id=%s --reason=capacity", msg.JobID))
+		if err := w.send(fmt.Sprintf("reject --job-id=%s --reason=capacity", msg.JobID)); err != nil {
+			w.cfg.Logger.Warn("[Worker][handlePropose] Failed to send reject", "job_id", msg.JobID, "reason", "capacity", "error", err)
+		}
 		return
 	}
 
-	w.send(fmt.Sprintf("accept --job-id=%s", msg.JobID))
+	if err := w.send(fmt.Sprintf("accept --job-id=%s", msg.JobID)); err != nil {
+		w.cfg.Logger.Warn("[Worker][handlePropose] Failed to send accept", "job_id", msg.JobID, "error", err)
+	}
 }
 
 func (w *Worker) handleDispatch(ctx context.Context, msg *contract.DispatchMessage) {
@@ -91,7 +103,9 @@ func (w *Worker) handleDispatch(ctx context.Context, msg *contract.DispatchMessa
 	w.tasks[msg.JobID] = &activeTask{cancel: cancel, cost: proposal.Cost, runID: msg.RunID}
 	w.tasksMu.Unlock()
 
-	w.send(fmt.Sprintf("staged --job-id=%s --run-id=%s", msg.JobID, msg.RunID))
+	if err := w.send(fmt.Sprintf("staged --job-id=%s --run-id=%s", msg.JobID, msg.RunID)); err != nil {
+		w.cfg.Logger.Warn("[Worker][handleDispatch] Failed to send staged", "job_id", msg.JobID, "run_id", msg.RunID, "error", err)
+	}
 
 	go w.runJob(taskCtx, proposal, msg)
 }
@@ -109,7 +123,9 @@ func (w *Worker) handleSystem(msg *contract.SystemMessage) {
 		if remaining == 0 {
 			w.state.Store(contract.WorkerStateShuttingDown)
 			w.cfg.Logger.Info("[Worker][handleSystem] Drain completed (no active tasks. Closing connection...")
-			w.conn.Close()
+			if err := w.closeConn(); err != nil {
+				w.cfg.Logger.Warn("[Worker][handleSystem] Failed to close connection after drain", "error", err)
+			}
 		}
 	case "shutdown":
 		if w.state.Transition(contract.WorkerStateOnline, contract.WorkerStateShuttingDown) || w.state.Transition(contract.WorkerStateDraining, contract.WorkerStateShuttingDown) {
@@ -137,18 +153,23 @@ func (w *Worker) runJob(ctx context.Context, proposal *contract.ProposeMessage, 
 	binaryPath, err := w.artifactCache.Fetch(ctx, proposal.ArtifactHash, proposal.ArtifactURL)
 	if err != nil {
 		w.cfg.Logger.Error("[Worker][runJob] Failed to fetch artifact", "job_id", dispatch.JobID, "error", err)
-		w.send(fmt.Sprintf("result --job-id=%s --type=error --reason='%s'",
-			dispatch.JobID, sanitize(err.Error())))
+		if err := w.send(fmt.Sprintf("result --job-id=%s --type=error --reason='%s'", dispatch.JobID, sanitize(err.Error()))); err != nil {
+			w.cfg.Logger.Error("[Worker][runJob] Failed to send result", "job_id", dispatch.JobID, "type", "error", "error", err)
+		}
 		return
 	}
 
-	w.send(fmt.Sprintf("starting --job-id=%s --run-id=%s", dispatch.JobID, dispatch.RunID))
+	if err := w.send(fmt.Sprintf("starting --job-id=%s --run-id=%s", dispatch.JobID, dispatch.RunID)); err != nil {
+		w.cfg.Logger.Warn("[Worker][runJob] Failed to send starting", "job_id", dispatch.JobID, "run_id", dispatch.RunID, "error", err)
+	}
 
 	taskTmpDir := filepath.Join(w.cfg.TmpStorageDir, dispatch.JobID)
 	w.cfg.Logger.Debug("[Worker][runJob] Creating task tmp dir", "job_id", dispatch.JobID, "tmp_dir", taskTmpDir)
 	if err := os.MkdirAll(taskTmpDir, 0o755); err != nil {
 		w.cfg.Logger.Error("[Worker][runJob] Failed to create task tmp dir", "job_id", dispatch.JobID, "tmp_dir", taskTmpDir, "error", err)
-		w.send(fmt.Sprintf("result --job-id=%s --run-id=%s --type=error --reason='%s'", dispatch.JobID, dispatch.RunID, sanitize(err.Error())))
+		if err := w.send(fmt.Sprintf("result --job-id=%s --run-id=%s --type=error --reason='%s'", dispatch.JobID, dispatch.RunID, sanitize(err.Error()))); err != nil {
+			w.cfg.Logger.Error("[Worker][runJob] Failed to send result", "job_id", dispatch.JobID, "run_id", dispatch.RunID, "type", "error", "error", err)
+		}
 		return
 	}
 	w.cfg.Logger.Debug("[Worker][runJob] Task tmp dir ready", "job_id", dispatch.JobID, "tmp_dir", taskTmpDir)
@@ -196,7 +217,9 @@ func (w *Worker) runJob(ctx context.Context, proposal *contract.ProposeMessage, 
 │  worker:  %s
 └────────────────────────────────────────────────────────
 `
-	w.sendWithPayload(logHeader, []byte(fmt.Sprintf(headertmpl, proposal.Task, dispatch.Phase, dispatch.Attempt, dispatch.JobID, dispatch.RunID, time.Now().Format(time.RFC3339), w.cfg.WorkerID)))
+	if err := w.sendWithPayload(logHeader, []byte(fmt.Sprintf(headertmpl, proposal.Task, dispatch.Phase, dispatch.Attempt, dispatch.JobID, dispatch.RunID, time.Now().Format(time.RFC3339), w.cfg.WorkerID))); err != nil {
+		w.cfg.Logger.Warn("[Worker][runJob] Failed to send log header", "job_id", dispatch.JobID, "run_id", dispatch.RunID, "error", err)
+	}
 
 	start := time.Now()
 	resultData, childJobsData, _, err := w.RunTask(ctx, t, logWriter)
@@ -221,29 +244,41 @@ func (w *Worker) runJob(ctx context.Context, proposal *contract.ProposeMessage, 
 			reason = err.Error()
 		}
 
-		w.sendWithPayload(logFooterHeader, []byte(fmt.Sprintf(footertmpl, "failed", time.Now().Format(time.RFC3339), duration.String(), reason)))
+		if err := w.sendWithPayload(logFooterHeader, []byte(fmt.Sprintf(footertmpl, "failed", time.Now().Format(time.RFC3339), duration.String(), reason))); err != nil {
+			w.cfg.Logger.Warn("[Worker][runJob] Failed to send log footer", "job_id", dispatch.JobID, "run_id", dispatch.RunID, "error", err)
+		}
 
 		header := fmt.Sprintf("result --job-id=%s --run-id=%s --type=error --exit-code=%d --duration=%s", dispatch.JobID, dispatch.RunID, code, duration.String())
 		slog.Debug("[Worker][runJob] Sending job error message", "header", header)
-		w.sendWithPayload(header, []byte(reason))
+		if err := w.sendWithPayload(header, []byte(reason)); err != nil {
+			w.cfg.Logger.Error("[Worker][runJob] Failed to send result", "job_id", dispatch.JobID, "run_id", dispatch.RunID, "type", "error", "error", err)
+		}
 		return
 	}
 
 	if len(childJobsData) > 0 {
-		w.sendWithPayload(logFooterHeader, []byte(fmt.Sprintf(footertmpl, "success", time.Now().Format(time.RFC3339), duration.String(), string(childJobsData))))
+		if err := w.sendWithPayload(logFooterHeader, []byte(fmt.Sprintf(footertmpl, "success", time.Now().Format(time.RFC3339), duration.String(), string(childJobsData)))); err != nil {
+			w.cfg.Logger.Warn("[Worker][runJob] Failed to send log footer", "job_id", dispatch.JobID, "run_id", dispatch.RunID, "error", err)
+		}
 
 		header := fmt.Sprintf("result --job-id=%s --run-id=%s --type=subjobs --duration=%s", dispatch.JobID, dispatch.RunID, duration.String())
 		slog.Debug("[Worker][runJob] Sending child job result message", "header", header, "payload", string(childJobsData))
-		w.sendWithPayload(header, childJobsData)
+		if err := w.sendWithPayload(header, childJobsData); err != nil {
+			w.cfg.Logger.Error("[Worker][runJob] Failed to send result", "job_id", dispatch.JobID, "run_id", dispatch.RunID, "type", "subjobs", "error", err)
+		}
 		return
 	}
 
-	w.sendWithPayload(logFooterHeader, []byte(fmt.Sprintf(footertmpl, "success", time.Now().Format(time.RFC3339), duration.String(), string(resultData))))
+	if err := w.sendWithPayload(logFooterHeader, []byte(fmt.Sprintf(footertmpl, "success", time.Now().Format(time.RFC3339), duration.String(), string(resultData)))); err != nil {
+		w.cfg.Logger.Warn("[Worker][runJob] Failed to send log footer", "job_id", dispatch.JobID, "run_id", dispatch.RunID, "error", err)
+	}
 
 	header := fmt.Sprintf("result --job-id=%s --run-id=%s --type=result --duration=%s", dispatch.JobID, dispatch.RunID, duration.String())
 	slog.Debug("[Worker][runJob] Sending job complete message", "header", header, "payload", string(resultData))
 
-	w.sendWithPayload(header, resultData)
+	if err := w.sendWithPayload(header, resultData); err != nil {
+		w.cfg.Logger.Error("[Worker][runJob] Failed to send result", "job_id", dispatch.JobID, "run_id", dispatch.RunID, "type", "result", "error", err)
+	}
 }
 
 // sanitize strips single quotes so values are safe to embed in a netargv single-quoted flag.
@@ -265,7 +300,9 @@ type logLineWriter struct {
 }
 
 func (l *logLineWriter) Write(p []byte) (int, error) {
-	l.w.sendWithPayload(fmt.Sprintf("log --job-id=%s --run-id=%s", l.jobID, l.runID), p)
+	if err := l.w.sendWithPayload(fmt.Sprintf("log --job-id=%s --run-id=%s", l.jobID, l.runID), p); err != nil {
+		l.w.cfg.Logger.Warn("[Worker][logLineWriter] Failed to send log line", "job_id", l.jobID, "run_id", l.runID, "error", err)
+	}
 
 	return len(p), nil
 
@@ -295,6 +332,8 @@ func (w *Worker) releaseTask(jobID string) {
 		w.state.Store(contract.WorkerStateShuttingDown)
 
 		w.cfg.Logger.Info("[Worker][releaseTask] Drain completed. Closing connection...")
-		w.conn.Close()
+		if err := w.closeConn(); err != nil {
+			w.cfg.Logger.Warn("[Worker][releaseTask] Failed to close connection after drain", "error", err)
+		}
 	}
 }
