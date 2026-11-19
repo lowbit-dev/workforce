@@ -9,7 +9,7 @@ require (
 	lowbit.dev/netargv v0.1.0
 	lowbit.dev/problemjson v0.1.0
 	lowbit.dev/retry v0.1.0
-	lowbit.dev/rungroup v0.1.0
+	lowbit.dev/rungroup v0.1.1
 	lowbit.dev/seriallane v0.1.0
 	lowbit.dev/sets v0.1.0
 	lowbit.dev/topic v0.1.0
